@@ -15,6 +15,7 @@ retrofitSerialization = "1.0.0"
 playIntegrity = "1.4.0"
 datastore = "1.1.1"
 coroutines = "1.9.0"
+sentry = "7.18.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -40,6 +41,8 @@ okhttp-logging = { group = "com.squareup.okhttp3", name = "logging-interceptor",
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 play-integrity = { group = "com.google.android.play", name = "integrity", version.ref = "playIntegrity" }
+sentry-android = { group = "io.sentry", name = "sentry-android", version.ref = "sentry" }
+sentry-compose = { group = "io.sentry", name = "sentry-compose-android", version.ref = "sentry" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
