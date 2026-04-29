@@ -1,7 +1,10 @@
 package com.dcodelabs.logi.sdk
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
 import android.net.Uri
+import android.os.Bundle
 import androidx.browser.customtabs.CustomTabsIntent
 import com.dcodelabs.logi.sdk.internal.Pkce
 import com.dcodelabs.logi.sdk.internal.TokenExchange
@@ -42,15 +45,31 @@ object LogiAuth {
     private var config: LogiAuthConfig? = null
     private var appContext: Context? = null
     private var pendingSignIn: CompletableDeferred<Result<LogiAuthResult>>? = null
+    private var pendingSignInLaunchedAt: Long = 0L
+
+    /**
+     * Set when [LogiAuthCallbackActivity] (or any callback handler) starts
+     * processing the redirect. The cancel-detector lifecycle callback uses
+     * this to avoid racing the in-flight token exchange with a spurious
+     * UserCancelled completion.
+     */
+    @Volatile internal var callbackInFlight: Boolean = false
 
     /**
      * Call once at Application.onCreate(). Storing the [Context] (as
      * applicationContext) is safe — it never holds an Activity reference.
+     *
+     * As a side effect we register an Application-level lifecycle callback
+     * so that if the user dismisses the Custom Tab without completing OAuth
+     * (back button / swipe close), we resolve the suspended [signIn] call
+     * with [LogiAuthError.UserCancelled] instead of hanging forever. Codex
+     * flagged this on the v1 design.
      */
     @JvmStatic
     fun configure(context: Context, config: LogiAuthConfig) {
         this.config = config
         this.appContext = context.applicationContext
+        registerCancelDetector(context.applicationContext as? Application)
     }
 
     /**
@@ -89,6 +108,7 @@ object LogiAuth {
 
         val deferred = CompletableDeferred<Result<LogiAuthResult>>()
         pendingSignIn = deferred
+        pendingSignInLaunchedAt = System.currentTimeMillis()
 
         CustomTabsIntent.Builder()
             .setShowTitle(true)
@@ -110,7 +130,8 @@ object LogiAuth {
             ?: return Result.failure(LogiAuthError.NoRefreshToken)
 
         return runCatching {
-            val result = TokenExchange(cfg.issuer).refresh(refreshToken, cfg.clientId)
+            val result = TokenExchange(cfg.issuer)
+                .refresh(refreshToken, cfg.clientId, cfg.clientSecret)
             persist(result)
             result
         }
@@ -145,6 +166,7 @@ object LogiAuth {
         val store = tokenStore() ?: return
         val deferred = pendingSignIn ?: return  // not awaiting any sign-in
 
+        callbackInFlight = true  // suppress the cancel-detector race
         try {
             val error = callbackUri.getQueryParameter("error")
             if (error != null) {
@@ -173,7 +195,7 @@ object LogiAuth {
             }
 
             val result = TokenExchange(cfg.issuer)
-                .exchangeCode(code, verifier, cfg.clientId, cfg.redirectUri)
+                .exchangeCode(code, verifier, cfg.clientId, cfg.clientSecret, cfg.redirectUri)
             persist(result)
             deferred.complete(Result.success(result))
         } catch (e: LogiAuthError) {
@@ -184,7 +206,48 @@ object LogiAuth {
             store.pkceVerifier = null
             store.pendingState = null
             pendingSignIn = null
+            callbackInFlight = false
         }
+    }
+
+    /**
+     * Detect Custom Tab dismissal via Application-level lifecycle callback.
+     * When the user closes the OAuth Custom Tab without completing consent,
+     * no callback Activity is invoked — we'd otherwise sit forever on
+     * `deferred.await()`. So when any RP-side Activity resumes after we
+     * launched a Custom Tab, AND the callback Activity hasn't fired (i.e.
+     * pendingSignIn is still set), AND a small grace period has elapsed
+     * (so we don't fire on the same-tick resume that PRECEDES Custom Tabs),
+     * we complete with UserCancelled.
+     *
+     * The 500ms grace handles the resume that fires immediately when
+     * Custom Tabs hands focus to the system browser process.
+     */
+    private var cancelDetectorRegistered = false
+    private fun registerCancelDetector(application: Application?) {
+        if (application == null || cancelDetectorRegistered) return
+        cancelDetectorRegistered = true
+        application.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: Activity) {
+                if (activity is LogiAuthCallbackActivity) return  // success path
+                if (callbackInFlight) return  // token exchange racing in IO
+                val deferred = pendingSignIn ?: return
+                val elapsed = System.currentTimeMillis() - pendingSignInLaunchedAt
+                if (elapsed < 500L) return  // pre-Custom-Tabs resume; ignore
+                deferred.complete(Result.failure(LogiAuthError.UserCancelled))
+                tokenStore()?.let {
+                    it.pkceVerifier = null
+                    it.pendingState = null
+                }
+                pendingSignIn = null
+            }
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityStarted(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivityStopped(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        })
     }
 
     private fun tokenStore(): TokenStore? {
