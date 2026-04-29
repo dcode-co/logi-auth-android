@@ -20,4 +20,18 @@ data class LogiAuthConfig(
     val clientId: String,
     val redirectUri: String,
     val scopes: List<String> = listOf("openid", "profile", "email"),
+    /**
+     * The logi server's `authenticate_oauth_client!` currently rejects token
+     * exchanges with a blank `client_secret` (returns 401 invalid_client) —
+     * even on PKCE flows. So mobile RPs do still need to pass the secret
+     * here until the server relaxes that for public clients.
+     *
+     * Storing a secret in a mobile app is a known compromise; minimize the
+     * blast radius by:
+     *   - using a per-installation secret you fetched at runtime if you have
+     *     one (rare), OR
+     *   - rotating regularly via `logi apps rotate-secret`, OR
+     *   - migrating to short-lived assertions once the server supports them.
+     */
+    val clientSecret: String? = null,
 )

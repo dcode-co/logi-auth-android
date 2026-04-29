@@ -30,6 +30,7 @@ internal class TokenExchange(private val issuer: String) {
         code: String,
         codeVerifier: String,
         clientId: String,
+        clientSecret: String?,
         redirectUri: String,
     ): LogiAuthResult = post(
         FormBody.Builder()
@@ -37,6 +38,7 @@ internal class TokenExchange(private val issuer: String) {
             .add("code", code)
             .add("code_verifier", codeVerifier)
             .add("client_id", clientId)
+            .apply { if (!clientSecret.isNullOrBlank()) add("client_secret", clientSecret) }
             .add("redirect_uri", redirectUri)
             .build()
     )
@@ -44,11 +46,13 @@ internal class TokenExchange(private val issuer: String) {
     suspend fun refresh(
         refreshToken: String,
         clientId: String,
+        clientSecret: String?,
     ): LogiAuthResult = post(
         FormBody.Builder()
             .add("grant_type", "refresh_token")
             .add("refresh_token", refreshToken)
             .add("client_id", clientId)
+            .apply { if (!clientSecret.isNullOrBlank()) add("client_secret", clientSecret) }
             .build()
     )
 
