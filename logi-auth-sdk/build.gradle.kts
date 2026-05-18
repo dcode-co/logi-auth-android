@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
+    `maven-publish`
 }
 
 android {
@@ -39,4 +40,21 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
+}
+
+// JitPack publishing — consumers add via:
+//   implementation("com.github.dcode-co:logi-auth-android:0.2.1")
+// Maven Central (com.dcodelabs:logi-auth-android) is P2; see
+// MIGRATION-PLAN.md.
+afterEvaluate {
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+                groupId = "com.github.dcode-co"
+                artifactId = "logi-auth-android"
+                version = "0.2.1"
+            }
+        }
+    }
 }
