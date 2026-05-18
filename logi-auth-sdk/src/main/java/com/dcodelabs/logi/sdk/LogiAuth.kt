@@ -95,6 +95,12 @@ object LogiAuth {
         val cfg = config ?: return Result.failure(LogiAuthError.NotConfigured)
         val store = tokenStore() ?: return Result.failure(LogiAuthError.NotConfigured)
 
+        // Reject concurrent signIn() calls — mirrors iOS
+        // LogiAuthError.alreadyInProgress. Without this guard, a second
+        // signIn() overwrites pendingSignIn and strands the first deferred
+        // forever. (codex P1, 2026-05-18.)
+        if (pendingSignIn != null) return Result.failure(LogiAuthError.AlreadyInProgress)
+
         val verifier = Pkce.generateVerifier()
         val challenge = Pkce.s256Challenge(verifier)
         val state = Pkce.randomState()
