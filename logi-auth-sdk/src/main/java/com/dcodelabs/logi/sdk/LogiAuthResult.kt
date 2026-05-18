@@ -30,6 +30,9 @@ sealed class LogiAuthError(message: String, cause: Throwable? = null) : RuntimeE
         "OAuth state parameter did not match — possible CSRF / hijack."
     )
     object UserCancelled : LogiAuthError("User cancelled the OAuth flow.")
+    object AlreadyInProgress : LogiAuthError(
+        "A signIn() call is already in progress — await or cancel the previous one first."
+    )
     object NoRefreshToken : LogiAuthError(
         "No refresh token persisted — user must call signIn() interactively."
     )
