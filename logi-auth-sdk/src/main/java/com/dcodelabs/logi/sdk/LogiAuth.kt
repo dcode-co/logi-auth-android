@@ -2,7 +2,10 @@ package com.dcodelabs.logi.sdk
 
 import android.app.Activity
 import android.app.Application
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import androidx.browser.customtabs.CustomTabsIntent
@@ -41,6 +44,9 @@ import kotlinx.coroutines.CompletableDeferred
  * share a mental model.
  */
 object LogiAuth {
+
+    /** Package name of the logi Android app — pinned for app-to-app handoff. */
+    private const val LOGI_APP_PACKAGE = "com.dcodelabs.logi"
 
     private var config: LogiAuthConfig? = null
     private var appContext: Context? = null
@@ -110,12 +116,81 @@ object LogiAuth {
         pendingSignIn = deferred
         pendingSignInLaunchedAt = System.currentTimeMillis()
 
-        CustomTabsIntent.Builder()
-            .setShowTitle(true)
-            .build()
-            .launchUrl(activity, authorizeUri)
+        // First-try app-to-app handoff (mirrors iOS LogiAuth's
+        // universalLinksOnly path + Kakao/Naver SDK pattern). If the logi
+        // app is installed, route the authorize Uri to it via explicit
+        // Intent.setPackage so the system doesn't show a chooser. On
+        // failure (not installed, intent filter mismatch, ActivityNotFound)
+        // fall back to Custom Tabs.
+        if (!tryNativeHandoff(activity, authorizeUri)) {
+            try {
+                CustomTabsIntent.Builder()
+                    .setShowTitle(true)
+                    .build()
+                    .launchUrl(activity, authorizeUri)
+            } catch (e: ActivityNotFoundException) {
+                // No browser / Custom Tabs handler installed. Clean up the
+                // suspended state so this call doesn't hang forever, then
+                // surface the failure. (codex review 2026-05-18: regression
+                // risk if we leave pendingSignIn set.)
+                pendingSignIn = null
+                store.pkceVerifier = null
+                store.pendingState = null
+                return Result.failure(LogiAuthError.Network(e))
+            }
+        }
 
         return deferred.await()
+    }
+
+    /**
+     * App-to-app handoff: launch the logi Android app directly when present.
+     * Returns true if the Intent fired, false if we should fall back to
+     * Custom Tabs.
+     *
+     * Why explicit Intent + setPackage instead of an implicit ACTION_VIEW?
+     * On Android 11+ the package visibility rules (and chooser UX) mean an
+     * implicit VIEW on an https authorize URL won't reliably resolve to the
+     * logi app even if it's installed. Checking PackageManager first +
+     * pinning the package gives us a deterministic, no-chooser launch when
+     * possible, exactly like `Kakao.loginWithKakaoTalk()` does. (The host
+     * app needs `<queries><package android:name="com.dcodelabs.logi" />`
+     * in its AndroidManifest — documented in the SDK README.)
+     */
+    private fun tryNativeHandoff(context: Context, authorizeUri: Uri): Boolean {
+        if (!isLogiAppInstalled(context)) return false
+        return try {
+            // signIn() requires an Activity context (documented), so no
+            // FLAG_ACTIVITY_NEW_TASK — the logi app should launch as a
+            // sibling on the same task stack so iOS-style returnAfterDone
+            // semantics work and back-stack navigation behaves correctly.
+            val intent = Intent(Intent.ACTION_VIEW, authorizeUri)
+                .setPackage(LOGI_APP_PACKAGE)
+            context.startActivity(intent)
+            true
+        } catch (_: ActivityNotFoundException) {
+            // PackageManager said the app is installed but it doesn't claim
+            // the authorize URI. Fall back to Custom Tabs.
+            false
+        }
+    }
+
+    /**
+     * Cheap synchronous check — equivalent to iOS
+     * `UIApplication.canOpenURL` for the logi scheme. Public so RPs can
+     * render different UI when the app is/isn't installed (e.g. "Continue
+     * with logi" button vs "Install logi" prompt).
+     */
+    @JvmStatic
+    fun isLogiAppInstalled(context: Context): Boolean = try {
+        val pm = context.packageManager
+        // getPackageInfo throws NameNotFoundException when the app isn't
+        // installed (or isn't visible under Android 11+ package visibility).
+        @Suppress("DEPRECATION")
+        pm.getPackageInfo(LOGI_APP_PACKAGE, 0)
+        true
+    } catch (_: PackageManager.NameNotFoundException) {
+        false
     }
 
     /**

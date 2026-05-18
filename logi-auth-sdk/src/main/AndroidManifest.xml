@@ -1,1 +1,11 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+        Contributed to the host RP's merged manifest so app-to-app handoff
+        in LogiAuth.tryNativeHandoff works on Android 11+ without each RP
+        having to remember to add this themselves. Required because package
+        visibility (API 30+) hides any package not declared here.
+    -->
+    <queries>
+        <package android:name="com.dcodelabs.logi" />
+    </queries>
+</manifest>
