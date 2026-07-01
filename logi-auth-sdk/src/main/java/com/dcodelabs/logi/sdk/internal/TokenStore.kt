@@ -40,6 +40,10 @@ internal class TokenStore(context: Context, clientId: String) {
         get() = prefs.getString(KEY_STATE, null)
         set(v) = prefs.edit().putString(KEY_STATE, v).apply()
 
+    var pendingNonce: String?
+        get() = prefs.getString(KEY_NONCE, null)
+        set(v) = prefs.edit().putString(KEY_NONCE, v).apply()
+
     fun clear() = prefs.edit().clear().apply()
 
     private companion object {
@@ -48,5 +52,6 @@ internal class TokenStore(context: Context, clientId: String) {
         const val KEY_ID = "id_token"
         const val KEY_PKCE = "pkce_verifier"
         const val KEY_STATE = "pending_state"
+        const val KEY_NONCE = "pending_nonce"
     }
 }

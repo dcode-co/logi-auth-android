@@ -19,19 +19,16 @@ data class LogiAuthConfig(
     val issuer: String,
     val clientId: String,
     val redirectUri: String,
-    val scopes: List<String> = listOf("openid", "profile", "email"),
+    val scopes: List<String> = listOf("openid", "profile:basic", "email"),
     /**
-     * The logi server's `authenticate_oauth_client!` currently rejects token
-     * exchanges with a blank `client_secret` (returns 401 invalid_client) —
-     * even on PKCE flows. So mobile RPs do still need to pass the secret
-     * here until the server relaxes that for public clients.
-     *
-     * Storing a secret in a mobile app is a known compromise; minimize the
-     * blast radius by:
-     *   - using a per-installation secret you fetched at runtime if you have
-     *     one (rare), OR
-     *   - rotating regularly via `logi apps rotate-secret`, OR
-     *   - migrating to short-lived assertions once the server supports them.
+     * Expected `iss` claim inside the id_token. This is the logi issuer STRING
+     * ("logi"), NOT the [issuer] URL — it mirrors the server's `OIDC_ISSUER`
+     * (`jwt_verifier.rb`). Only override for a non-standard deployment.
      */
-    val clientSecret: String? = null,
+    val tokenIssuer: String = "logi",
 )
+// NOTE (v1.0): `clientSecret` was removed. This SDK is a **public client** —
+// the logi server now accepts (and requires) PKCE-only token exchanges for
+// registered public clients (secret rejected + PKCE enforced server-side,
+// oauth_application.rb CLIENT_TYPES). Never ship a client secret in a mobile
+// app. Register your app as a public client with `logi apps create`.

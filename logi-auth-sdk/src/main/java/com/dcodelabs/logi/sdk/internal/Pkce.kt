@@ -30,6 +30,12 @@ internal object Pkce {
         return base64Url(bytes)
     }
 
+    /** 32 random bytes, base64url — the OIDC nonce bound to one authorize req. */
+    fun randomNonce(): String {
+        val bytes = ByteArray(32).also { rng.nextBytes(it) }
+        return base64Url(bytes)
+    }
+
     private fun base64Url(bytes: ByteArray): String =
         Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
 }
