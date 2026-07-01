@@ -57,7 +57,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.dcode-co"
                 artifactId = "logi-auth-android"
-                version = "0.2.2"
+                version = "1.0.0"
                 pom {
                     name.set("logi-auth-android")
                     licenses {
