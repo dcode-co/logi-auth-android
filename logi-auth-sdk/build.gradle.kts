@@ -58,6 +58,15 @@ afterEvaluate {
                 groupId = "com.github.dcode-co"
                 artifactId = "logi-auth-android"
                 version = "0.2.2"
+                pom {
+                    name.set("logi-auth-android")
+                    licenses {
+                        license {
+                            name.set("Apache License, Version 2.0")
+                            url.set("https://www.apache.org/licenses/LICENSE-2.0")
+                        }
+                    }
+                }
             }
         }
     }
