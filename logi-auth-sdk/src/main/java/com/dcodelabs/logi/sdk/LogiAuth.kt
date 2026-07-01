@@ -13,9 +13,9 @@ import com.dcodelabs.logi.sdk.internal.IdTokenVerificationException
 import com.dcodelabs.logi.sdk.internal.IdTokenVerifyError
 import com.dcodelabs.logi.sdk.internal.Jwks
 import com.dcodelabs.logi.sdk.internal.JwksClient
+import com.dcodelabs.logi.sdk.internal.PendingAuthStore
 import com.dcodelabs.logi.sdk.internal.Pkce
 import com.dcodelabs.logi.sdk.internal.TokenExchange
-import com.dcodelabs.logi.sdk.internal.TokenStore
 import com.dcodelabs.logi.sdk.internal.VerifiedIdToken
 import com.dcodelabs.logi.sdk.internal.VerifyExpected
 import com.dcodelabs.logi.sdk.internal.verifyIdToken
@@ -106,7 +106,7 @@ object LogiAuth {
         scopes: List<String>? = null,
     ): Result<LogiSession> {
         val cfg = config ?: return Result.failure(LogiAuthError.NotConfigured)
-        val store = tokenStore() ?: return Result.failure(LogiAuthError.NotConfigured)
+        val store = pendingStore() ?: return Result.failure(LogiAuthError.NotConfigured)
 
         // Reject concurrent signIn() calls — mirrors iOS
         // LogiAuthError.alreadyInProgress. Without this guard, a second
@@ -219,37 +219,13 @@ object LogiAuth {
         false
     }
 
-    /**
-     * Refresh the persisted access token. Returns failure if no refresh
-     * token is on file — caller should drop into [signIn] in that case.
-     */
-    @JvmStatic
-    suspend fun refresh(): Result<LogiAuthResult> {
-        val cfg = config ?: return Result.failure(LogiAuthError.NotConfigured)
-        val store = tokenStore() ?: return Result.failure(LogiAuthError.NotConfigured)
-        val refreshToken = store.refreshToken
-            ?: return Result.failure(LogiAuthError.NoRefreshToken)
-
-        return runCatching {
-            val result = TokenExchange(cfg.issuer)
-                .refresh(refreshToken, cfg.clientId)
-            persist(result)
-            result
-        }
-    }
-
-    @JvmStatic
-    fun signOut() {
-        tokenStore()?.clear()
-    }
-
-    /** Synchronous read for early-launch decisions (e.g. show signed-in UI). */
-    @JvmStatic
-    fun currentRefreshToken(): String? = tokenStore()?.refreshToken
-
-    /** Same idea, the access token. Probably stale — call [refresh] first. */
-    @JvmStatic
-    fun currentAccessToken(): String? = tokenStore()?.accessToken
+    // Token persistence, refresh(), and signOut() are NOT part of the auth
+    // core — they live in the optional `:logi-auth-storage` module
+    // (LogiAuthStorage). The core connector only proves identity and returns a
+    // verified LogiSession; where/whether the session's tokens are stored is
+    // the RP app's concern. Only the transient PKCE flow state (verifier /
+    // state / nonce) is persisted here, because it must survive process death
+    // across the Custom Tab round-trip.
 
     // ─── Callback handler ────────────────────────────────────────────────
 
@@ -264,7 +240,7 @@ object LogiAuth {
     @JvmStatic
     suspend fun handleAuthorizationCallback(callbackUri: Uri) {
         val cfg = config ?: return
-        val store = tokenStore() ?: return
+        val store = pendingStore() ?: return
         val deferred = pendingSignIn ?: return  // not awaiting any sign-in
 
         callbackInFlight = true  // suppress the cancel-detector race
@@ -323,7 +299,6 @@ object LogiAuth {
                 scope = result.scope,
                 expiresInSec = result.expiresInSec,
             )
-            persist(result)
             deferred.complete(Result.success(session))
         } catch (e: LogiAuthError) {
             deferred.complete(Result.failure(e))
@@ -404,11 +379,7 @@ object LogiAuth {
                 val elapsed = System.currentTimeMillis() - pendingSignInLaunchedAt
                 if (elapsed < 500L) return  // pre-Custom-Tabs resume; ignore
                 deferred.complete(Result.failure(LogiAuthError.UserCancelled))
-                tokenStore()?.let {
-                    it.pkceVerifier = null
-                    it.pendingState = null
-                    it.pendingNonce = null
-                }
+                pendingStore()?.clear()
                 pendingSignIn = null
             }
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
@@ -420,16 +391,9 @@ object LogiAuth {
         })
     }
 
-    private fun tokenStore(): TokenStore? {
+    private fun pendingStore(): PendingAuthStore? {
         val ctx = appContext ?: return null
         val cfg = config ?: return null
-        return TokenStore(ctx, cfg.clientId)
-    }
-
-    private fun persist(result: LogiAuthResult) {
-        val store = tokenStore() ?: return
-        store.accessToken = result.accessToken
-        result.refreshToken?.let { store.refreshToken = it }
-        result.idToken?.let { store.idToken = it }
+        return PendingAuthStore(ctx, cfg.clientId)
     }
 }
