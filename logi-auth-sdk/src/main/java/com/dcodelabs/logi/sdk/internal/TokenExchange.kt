@@ -26,11 +26,11 @@ internal class TokenExchange(private val issuer: String) {
 
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
 
+    // Public client — no client_secret. PKCE (code_verifier) is the proof.
     suspend fun exchangeCode(
         code: String,
         codeVerifier: String,
         clientId: String,
-        clientSecret: String?,
         redirectUri: String,
     ): LogiAuthResult = post(
         FormBody.Builder()
@@ -38,7 +38,6 @@ internal class TokenExchange(private val issuer: String) {
             .add("code", code)
             .add("code_verifier", codeVerifier)
             .add("client_id", clientId)
-            .apply { if (!clientSecret.isNullOrBlank()) add("client_secret", clientSecret) }
             .add("redirect_uri", redirectUri)
             .build()
     )
@@ -46,13 +45,11 @@ internal class TokenExchange(private val issuer: String) {
     suspend fun refresh(
         refreshToken: String,
         clientId: String,
-        clientSecret: String?,
     ): LogiAuthResult = post(
         FormBody.Builder()
             .add("grant_type", "refresh_token")
             .add("refresh_token", refreshToken)
             .add("client_id", clientId)
-            .apply { if (!clientSecret.isNullOrBlank()) add("client_secret", clientSecret) }
             .build()
     )
 

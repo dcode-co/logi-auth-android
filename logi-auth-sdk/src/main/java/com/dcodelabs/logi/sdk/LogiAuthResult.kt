@@ -17,6 +17,25 @@ data class LogiAuthResult(
 )
 
 /**
+ * The verified outcome of a successful [LogiAuth.signIn]. [sub] is populated
+ * only after this SDK has verified the id_token's RS256 signature and claims —
+ * the sole new safety contract of v1.0. Identical shape across all 4 SDKs.
+ */
+data class LogiSession(
+    /** Verified subject from the id_token — pairwise per client. */
+    val sub: String,
+    /** `email` claim, if present and the scope was granted. */
+    val email: String?,
+    /** Raw id_token (already verified by this SDK). */
+    val idToken: String,
+    val accessToken: String,
+    val refreshToken: String?,
+    val tokenType: String,
+    val scope: String?,
+    val expiresInSec: Long?,
+)
+
+/**
  * Sealed error hierarchy. Use [LogiAuthError] in a try/catch around
  * [LogiAuth.signIn] / [LogiAuth.refresh] for typed handling, or fall back to
  * the standard kotlin.Result success/failure pattern those methods return.
@@ -36,6 +55,11 @@ sealed class LogiAuthError(message: String, cause: Throwable? = null) : RuntimeE
     object NoRefreshToken : LogiAuthError(
         "No refresh token persisted — user must call signIn() interactively."
     )
+    object MissingIdToken : LogiAuthError(
+        "Token response had no id_token — was `openid` in the requested scopes?"
+    )
+    class IdTokenInvalid(val code: String) : LogiAuthError("id_token verification failed ($code).")
+    class JwksFetchFailed(val status: Int) : LogiAuthError("JWKS fetch failed (HTTP $status).")
     class TokenEndpoint(detail: String) : LogiAuthError("/oauth/token rejected the exchange: $detail")
     class Network(cause: Throwable) : LogiAuthError("Network error: ${cause.message}", cause)
 }

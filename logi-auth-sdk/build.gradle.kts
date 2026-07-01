@@ -40,6 +40,10 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
+
+    // Local JVM unit tests only (golden id_token vectors). The verifier is pure
+    // java.security + kotlinx-serialization, so no Android/Robolectric needed.
+    testImplementation("junit:junit:4.13.2")
 }
 
 // JitPack publishing — consumers add via:

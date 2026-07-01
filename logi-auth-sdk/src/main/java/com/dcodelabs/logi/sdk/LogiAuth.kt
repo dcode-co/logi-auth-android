@@ -9,10 +9,18 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import androidx.browser.customtabs.CustomTabsIntent
+import com.dcodelabs.logi.sdk.internal.IdTokenVerificationException
+import com.dcodelabs.logi.sdk.internal.IdTokenVerifyError
+import com.dcodelabs.logi.sdk.internal.Jwks
+import com.dcodelabs.logi.sdk.internal.JwksClient
 import com.dcodelabs.logi.sdk.internal.Pkce
 import com.dcodelabs.logi.sdk.internal.TokenExchange
 import com.dcodelabs.logi.sdk.internal.TokenStore
+import com.dcodelabs.logi.sdk.internal.VerifiedIdToken
+import com.dcodelabs.logi.sdk.internal.VerifyExpected
+import com.dcodelabs.logi.sdk.internal.verifyIdToken
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * Public entry point for RP apps integrating logi as their identity
@@ -50,8 +58,13 @@ object LogiAuth {
 
     private var config: LogiAuthConfig? = null
     private var appContext: Context? = null
-    private var pendingSignIn: CompletableDeferred<Result<LogiAuthResult>>? = null
+    private var pendingSignIn: CompletableDeferred<Result<LogiSession>>? = null
     private var pendingSignInLaunchedAt: Long = 0L
+
+    /** In-memory JWKS cache (issuer, keys, fetchedAtMillis). Rare rotation, so
+     *  a 1h window avoids a round-trip per sign-in; unknown_kid busts it. */
+    private var jwksCache: Triple<String, Jwks, Long>? = null
+    private const val JWKS_TTL_MS = 3_600_000L
 
     /**
      * Set when [LogiAuthCallbackActivity] (or any callback handler) starts
@@ -91,7 +104,7 @@ object LogiAuth {
     suspend fun signIn(
         activity: Context,
         scopes: List<String>? = null,
-    ): Result<LogiAuthResult> {
+    ): Result<LogiSession> {
         val cfg = config ?: return Result.failure(LogiAuthError.NotConfigured)
         val store = tokenStore() ?: return Result.failure(LogiAuthError.NotConfigured)
 
@@ -104,8 +117,13 @@ object LogiAuth {
         val verifier = Pkce.generateVerifier()
         val challenge = Pkce.s256Challenge(verifier)
         val state = Pkce.randomState()
+        // nonce is always generated and always verified — it binds the id_token
+        // to this specific authorize request (replay defense). Server echoes it
+        // through authorize → grant → id_token (id_token_issuer.rb).
+        val nonce = Pkce.randomNonce()
         store.pkceVerifier = verifier
         store.pendingState = state
+        store.pendingNonce = nonce
 
         val authorizeUri = Uri.parse(cfg.issuer.trimEnd('/') + "/oauth/authorize")
             .buildUpon()
@@ -114,11 +132,12 @@ object LogiAuth {
             .appendQueryParameter("redirect_uri", cfg.redirectUri)
             .appendQueryParameter("scope", (scopes ?: cfg.scopes).joinToString(" "))
             .appendQueryParameter("state", state)
+            .appendQueryParameter("nonce", nonce)
             .appendQueryParameter("code_challenge", challenge)
             .appendQueryParameter("code_challenge_method", "S256")
             .build()
 
-        val deferred = CompletableDeferred<Result<LogiAuthResult>>()
+        val deferred = CompletableDeferred<Result<LogiSession>>()
         pendingSignIn = deferred
         pendingSignInLaunchedAt = System.currentTimeMillis()
 
@@ -142,6 +161,7 @@ object LogiAuth {
                 pendingSignIn = null
                 store.pkceVerifier = null
                 store.pendingState = null
+                store.pendingNonce = null
                 return Result.failure(LogiAuthError.Network(e))
             }
         }
@@ -212,7 +232,7 @@ object LogiAuth {
 
         return runCatching {
             val result = TokenExchange(cfg.issuer)
-                .refresh(refreshToken, cfg.clientId, cfg.clientSecret)
+                .refresh(refreshToken, cfg.clientId)
             persist(result)
             result
         }
@@ -276,9 +296,32 @@ object LogiAuth {
             }
 
             val result = TokenExchange(cfg.issuer)
-                .exchangeCode(code, verifier, cfg.clientId, cfg.clientSecret, cfg.redirectUri)
+                .exchangeCode(code, verifier, cfg.clientId, cfg.redirectUri)
             persist(result)
-            deferred.complete(Result.success(result))
+
+            // Verify the id_token (public-client trust boundary). This is the
+            // sole new safety contract of v1.0 — `sub` is set only after the
+            // RS256 signature + claims (incl. nonce) check out.
+            val idToken = result.idToken
+                ?: throw LogiAuthError.MissingIdToken
+            val verified = verifyIdTokenWithRotationRetry(
+                issuer = cfg.issuer,
+                idToken = idToken,
+                expected = VerifyExpected(cfg.tokenIssuer, cfg.clientId, store.pendingNonce),
+            )
+            val email = (verified.claims["email"] as? JsonPrimitive)
+                ?.let { if (it.isString) it.content else null }
+            val session = LogiSession(
+                sub = verified.sub,
+                email = email,
+                idToken = idToken,
+                accessToken = result.accessToken,
+                refreshToken = result.refreshToken,
+                tokenType = result.tokenType,
+                scope = result.scope,
+                expiresInSec = result.expiresInSec,
+            )
+            deferred.complete(Result.success(session))
         } catch (e: LogiAuthError) {
             deferred.complete(Result.failure(e))
         } catch (e: Throwable) {
@@ -286,9 +329,51 @@ object LogiAuth {
         } finally {
             store.pkceVerifier = null
             store.pendingState = null
+            store.pendingNonce = null
             pendingSignIn = null
             callbackInFlight = false
         }
+    }
+
+    /**
+     * Fetch JWKS (1h cache) and verify. On `unknown_kid` served from a stale
+     * cache — i.e. the IdP rotated signing keys within the TTL window — bust the
+     * cache, refetch once, and re-verify so normal key rotation doesn't lock out
+     * every sign-in for the rest of the hour. Throws [LogiAuthError.IdTokenInvalid]
+     * on a genuine verification failure. (codex P1, iOS 2026-07-01.)
+     */
+    private suspend fun verifyIdTokenWithRotationRetry(
+        issuer: String,
+        idToken: String,
+        expected: VerifyExpected,
+    ): VerifiedIdToken {
+        val (jwks, fromCache) = fetchJwks(issuer, forceRefresh = false)
+        return try {
+            verifyIdToken(idToken, jwks, expected)
+        } catch (e: IdTokenVerificationException) {
+            if (e.error == IdTokenVerifyError.UNKNOWN_KID && fromCache) {
+                val (freshJwks, _) = fetchJwks(issuer, forceRefresh = true)
+                try {
+                    verifyIdToken(idToken, freshJwks, expected)
+                } catch (retry: IdTokenVerificationException) {
+                    throw LogiAuthError.IdTokenInvalid(retry.error.code)
+                }
+            } else {
+                throw LogiAuthError.IdTokenInvalid(e.error.code)
+            }
+        }
+    }
+
+    private suspend fun fetchJwks(issuer: String, forceRefresh: Boolean): Pair<Jwks, Boolean> {
+        val cached = jwksCache
+        if (!forceRefresh && cached != null && cached.first == issuer &&
+            System.currentTimeMillis() - cached.third < JWKS_TTL_MS
+        ) {
+            return cached.second to true
+        }
+        val jwks = JwksClient(issuer).fetch()
+        jwksCache = Triple(issuer, jwks, System.currentTimeMillis())
+        return jwks to false
     }
 
     /**
@@ -319,6 +404,7 @@ object LogiAuth {
                 tokenStore()?.let {
                     it.pkceVerifier = null
                     it.pendingState = null
+                    it.pendingNonce = null
                 }
                 pendingSignIn = null
             }
