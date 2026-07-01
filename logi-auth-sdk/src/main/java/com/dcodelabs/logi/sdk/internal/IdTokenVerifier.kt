@@ -57,7 +57,7 @@ data class Jwk(
 data class Jwks(val keys: List<Jwk>)
 
 data class VerifyExpected(
-    /** id_token.iss must equal this (logi issuer STRING "logi", NOT a URL). */
+    /** id_token.iss must equal this (logi issuer URL "https://api.1pass.dev" in prod; "logi" is a dev-only fallback). */
     val issuer: String,
     /** id_token.aud must contain this (the RP's client_id). */
     val clientId: String,

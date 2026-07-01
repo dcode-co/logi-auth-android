@@ -21,11 +21,12 @@ data class LogiAuthConfig(
     val redirectUri: String,
     val scopes: List<String> = listOf("openid", "profile:basic", "email"),
     /**
-     * Expected `iss` claim inside the id_token. This is the logi issuer STRING
-     * ("logi"), NOT the [issuer] URL — it mirrors the server's `OIDC_ISSUER`
-     * (`jwt_verifier.rb`). Only override for a non-standard deployment.
+     * Expected `iss` claim inside the id_token. In production this is the logi
+     * issuer URL "https://api.1pass.dev" — it mirrors the server's `OIDC_ISSUER`
+     * (`jwt_verifier.rb`). (The bare string "logi" is a dev-only fallback.)
+     * Only override for a non-standard deployment.
      */
-    val tokenIssuer: String = "logi",
+    val tokenIssuer: String = "https://api.1pass.dev",
 )
 // NOTE (v1.0): `clientSecret` was removed. This SDK is a **public client** —
 // the logi server now accepts (and requires) PKCE-only token exchanges for
