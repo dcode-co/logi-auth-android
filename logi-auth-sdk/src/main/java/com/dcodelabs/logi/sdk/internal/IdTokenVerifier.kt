@@ -3,6 +3,7 @@ package com.dcodelabs.logi.sdk.internal
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.doubleOrNull
@@ -92,6 +93,12 @@ fun verifyIdToken(
     val header = decodeJsonSegment(parts[0]) ?: throw IdTokenVerificationException(IdTokenVerifyError.MALFORMED)
     val payload = decodeJsonSegment(parts[1]) ?: throw IdTokenVerificationException(IdTokenVerifyError.MALFORMED)
 
+    // Only RS256 is accepted — never verify a token whose header declares
+    // another (or no) algorithm, even if the RSA signature happens to match.
+    if (stringClaim(header, "alg") != "RS256") {
+        throw IdTokenVerificationException(IdTokenVerifyError.BAD_SIGNATURE)
+    }
+
     // kid → JWKS key.
     val kid = stringClaim(header, "kid")
     if (kid.isNullOrEmpty()) throw IdTokenVerificationException(IdTokenVerifyError.MISSING_KID)
@@ -111,6 +118,17 @@ fun verifyIdToken(
 
     if (!audienceMatches(payload["aud"], expected.clientId)) {
         throw IdTokenVerificationException(IdTokenVerifyError.AUD_MISMATCH)
+    }
+
+    // OIDC §3.1.3.7 azp: with multiple audiences an azp MUST be present; whenever
+    // azp is present it MUST equal our client_id.
+    val audElement = payload["aud"]
+    val azp = payload["azp"]
+    val azpString = (azp as? JsonPrimitive)?.let { if (it.isString) it.content else null }
+    if (audElement is JsonArray && audElement.size > 1) {
+        if (azpString != expected.clientId) throw IdTokenVerificationException(IdTokenVerifyError.AUD_MISMATCH)
+    } else if (azp != null && azp !is JsonNull) {
+        if (azpString != expected.clientId) throw IdTokenVerificationException(IdTokenVerifyError.AUD_MISMATCH)
     }
 
     val exp = numericClaim(payload["exp"])
