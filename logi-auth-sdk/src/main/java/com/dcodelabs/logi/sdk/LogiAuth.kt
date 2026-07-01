@@ -297,11 +297,13 @@ object LogiAuth {
 
             val result = TokenExchange(cfg.issuer)
                 .exchangeCode(code, verifier, cfg.clientId, cfg.redirectUri)
-            persist(result)
 
             // Verify the id_token (public-client trust boundary). This is the
             // sole new safety contract of v1.0 — `sub` is set only after the
-            // RS256 signature + claims (incl. nonce) check out.
+            // RS256 signature + claims (incl. nonce) check out. Persist tokens
+            // ONLY after verification succeeds: a missing/invalid id_token or a
+            // JWKS failure must not leave durable authenticated state that
+            // currentAccessToken()/refresh() could later read. (codex P1.)
             val idToken = result.idToken
                 ?: throw LogiAuthError.MissingIdToken
             val verified = verifyIdTokenWithRotationRetry(
@@ -321,6 +323,7 @@ object LogiAuth {
                 scope = result.scope,
                 expiresInSec = result.expiresInSec,
             )
+            persist(result)
             deferred.complete(Result.success(session))
         } catch (e: LogiAuthError) {
             deferred.complete(Result.failure(e))
