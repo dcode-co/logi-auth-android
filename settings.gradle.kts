@@ -12,3 +12,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "logi-auth-android"
 include(":logi-auth-sdk")
+include(":logi-auth-storage")

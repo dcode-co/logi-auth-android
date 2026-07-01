@@ -42,17 +42,6 @@ internal class TokenExchange(private val issuer: String) {
             .build()
     )
 
-    suspend fun refresh(
-        refreshToken: String,
-        clientId: String,
-    ): LogiAuthResult = post(
-        FormBody.Builder()
-            .add("grant_type", "refresh_token")
-            .add("refresh_token", refreshToken)
-            .add("client_id", clientId)
-            .build()
-    )
-
     private suspend fun post(body: FormBody): LogiAuthResult = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url(issuer.trimEnd('/') + "/oauth/token")
