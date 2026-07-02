@@ -28,7 +28,14 @@ class IdTokenVerifierTest {
     private data class Expected(val issuer: String, val clientId: String, val nonce: String? = null)
 
     @Serializable
-    private data class Case(val name: String, val token: String, val expect: Expect)
+    private data class Case(
+        val name: String,
+        val token: String,
+        // Present-only at_hash binding: threaded into verifyIdToken when set
+        // (cases without it skip at_hash, staying backward compatible).
+        val accessToken: String? = null,
+        val expect: Expect,
+    )
 
     @Serializable
     private data class Expect(val valid: Boolean, val sub: String? = null, val error: String? = null)
@@ -51,7 +58,7 @@ class IdTokenVerifierTest {
 
         for (c in v.cases) {
             try {
-                val result = verifyIdToken(c.token, v.jwks, expected, now = v.now)
+                val result = verifyIdToken(c.token, v.jwks, expected, now = v.now, accessToken = c.accessToken)
                 assertTrue("case '${c.name}' expected to be invalid but verified", c.expect.valid)
                 c.expect.sub?.let { assertEquals("case '${c.name}' sub mismatch", it, result.sub) }
             } catch (e: IdTokenVerificationException) {

@@ -286,6 +286,7 @@ object LogiAuth {
                 issuer = cfg.issuer,
                 idToken = idToken,
                 expected = VerifyExpected(cfg.tokenIssuer, cfg.clientId, store.pendingNonce),
+                accessToken = result.accessToken,
             )
             val email = (verified.claims["email"] as? JsonPrimitive)
                 ?.let { if (it.isString) it.content else null }
@@ -324,15 +325,16 @@ object LogiAuth {
         issuer: String,
         idToken: String,
         expected: VerifyExpected,
+        accessToken: String? = null,
     ): VerifiedIdToken {
         val (jwks, fromCache) = fetchJwks(issuer, forceRefresh = false)
         return try {
-            verifyIdToken(idToken, jwks, expected)
+            verifyIdToken(idToken, jwks, expected, accessToken = accessToken)
         } catch (e: IdTokenVerificationException) {
             if (e.error == IdTokenVerifyError.UNKNOWN_KID && fromCache) {
                 val (freshJwks, _) = fetchJwks(issuer, forceRefresh = true)
                 try {
-                    verifyIdToken(idToken, freshJwks, expected)
+                    verifyIdToken(idToken, freshJwks, expected, accessToken = accessToken)
                 } catch (retry: IdTokenVerificationException) {
                     throw LogiAuthError.IdTokenInvalid(retry.error.code)
                 }
@@ -341,6 +343,35 @@ object LogiAuth {
             }
         }
     }
+
+    /**
+     * Re-verify an id_token returned by a **refresh_token** exchange before it
+     * is trusted or persisted, reusing the same JWKS fetch + key-rotation-retry
+     * path as [signIn]. There is no nonce on a refresh, so nonce is not checked
+     * (signature / iss / aud / azp / exp / iat / sub are). If [accessToken] and
+     * an `at_hash` claim are both present the access_token is bound too.
+     *
+     * Exposed as module-public so the optional `:logi-auth-storage` companion
+     * can call it from `refresh()` without duplicating the (private) rotation
+     * logic. The verification config is passed in explicitly so this does not
+     * depend on [configure] having been called on this static object.
+     *
+     * Throws [LogiAuthError.IdTokenInvalid] / [LogiAuthError.JwksFetchFailed] /
+     * [LogiAuthError.Network] on failure.
+     */
+    @JvmStatic
+    suspend fun verifyRefreshedIdToken(
+        idToken: String,
+        accessToken: String?,
+        issuer: String,
+        tokenIssuer: String,
+        clientId: String,
+    ): VerifiedIdToken = verifyIdTokenWithRotationRetry(
+        issuer = issuer,
+        idToken = idToken,
+        expected = VerifyExpected(tokenIssuer, clientId, nonce = null),
+        accessToken = accessToken,
+    )
 
     private suspend fun fetchJwks(issuer: String, forceRefresh: Boolean): Pair<Jwks, Boolean> {
         val cached = jwksCache

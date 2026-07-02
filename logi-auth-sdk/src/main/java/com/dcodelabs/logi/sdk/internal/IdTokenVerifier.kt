@@ -10,6 +10,7 @@ import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import java.math.BigInteger
 import java.security.KeyFactory
+import java.security.MessageDigest
 import java.security.Signature
 import java.security.spec.RSAPublicKeySpec
 
@@ -37,6 +38,7 @@ enum class IdTokenVerifyError(val code: String) {
     EXPIRED("expired"),
     NONCE_MISMATCH("nonce_mismatch"),
     MISSING_CLAIM("missing_claim"),
+    AT_HASH_MISMATCH("at_hash_mismatch"),
 }
 
 /** Thrown by [verifyIdToken]. Carries the machine [error] (and its `.code`). */
@@ -46,8 +48,12 @@ class IdTokenVerificationException(val error: IdTokenVerifyError) :
 @Serializable
 data class Jwk(
     val kty: String,
-    val n: String,
-    val e: String,
+    // RSA-only parameters — nullable so a JWKS that also carries non-RSA keys
+    // (e.g. an EC key with crv/x/y and no n/e) still DESERIALIZES. Otherwise the
+    // whole JwksClient.fetch() would throw on the missing required field before
+    // the kty filter below could skip that key, locking out every sign-in.
+    val n: String? = null,
+    val e: String? = null,
     val kid: String,
     val alg: String? = null,
     val use: String? = null,
@@ -73,10 +79,14 @@ private val jsonParser = Json { ignoreUnknownKeys = true }
  * Verify a logi-issued id_token and return its verified subject. Throws
  * [IdTokenVerificationException] on any failure — never returns an unverified
  * subject. Claim order matches server + Web/iOS:
- * signature → iss → aud → exp → iat → nonce → sub.
+ * signature → iss → aud → exp → iat → nonce → sub → at_hash.
  *
  * @param now Unix seconds; defaults to now. Injectable for deterministic tests.
  * @param clockSkewSec allowed clock skew in seconds (default 60).
+ * @param accessToken if non-null AND the payload carries an `at_hash` claim, the
+ *   access_token is bound to this id_token per OIDC §3.1.3.6 (defends against
+ *   token substitution). Defaults null for backward compatibility — when either
+ *   the claim or the access_token is absent the check is skipped.
  */
 fun verifyIdToken(
     idToken: String,
@@ -84,6 +94,7 @@ fun verifyIdToken(
     expected: VerifyExpected,
     now: Long = System.currentTimeMillis() / 1000,
     clockSkewSec: Long = 60,
+    accessToken: String? = null,
 ): VerifiedIdToken {
     val parts = idToken.split(".")
     if (parts.size != 3 || parts[0].isEmpty() || parts[1].isEmpty() || parts[2].isEmpty()) {
@@ -99,11 +110,19 @@ fun verifyIdToken(
         throw IdTokenVerificationException(IdTokenVerifyError.BAD_SIGNATURE)
     }
 
-    // kid → JWKS key.
+    // kid → JWKS key. Restrict to RS256-capable RSA signing keys so a future
+    // EC (or encryption `use=enc`) key sharing the same kid can never be
+    // selected for RS256 signature verification. Non-matching kid keeps the
+    // existing UNKNOWN_KID contract.
     val kid = stringClaim(header, "kid")
     if (kid.isNullOrEmpty()) throw IdTokenVerificationException(IdTokenVerifyError.MISSING_KID)
-    val jwk = jwks.keys.firstOrNull { it.kid == kid }
-        ?: throw IdTokenVerificationException(IdTokenVerifyError.UNKNOWN_KID)
+    val jwk = jwks.keys.firstOrNull {
+        it.kid == kid &&
+            it.kty == "RSA" &&
+            it.n != null && it.e != null &&
+            (it.use == null || it.use == "sig") &&
+            (it.alg == null || it.alg == "RS256")
+    } ?: throw IdTokenVerificationException(IdTokenVerifyError.UNKNOWN_KID)
 
     // RS256 signature verification via java.security (no dependency).
     val signature = base64UrlDecode(parts[2]) ?: throw IdTokenVerificationException(IdTokenVerifyError.BAD_SIGNATURE)
@@ -149,14 +168,28 @@ fun verifyIdToken(
     val sub = stringClaim(payload, "sub")
     if (sub.isNullOrEmpty()) throw IdTokenVerificationException(IdTokenVerifyError.MISSING_CLAIM)
 
+    // at_hash (OIDC §3.1.3.6) — last, and only when both the claim and the
+    // access_token are present. at_hash = base64url_nopad( SHA-256(ASCII bytes
+    // of access_token)[0 .. 15] ) — the left-most 128 bits (16 bytes). Binding
+    // the access_token to the id_token blocks token-substitution attacks.
+    val atHash = stringClaim(payload, "at_hash")
+    if (atHash != null && accessToken != null) {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(accessToken.toByteArray(Charsets.UTF_8))
+        val computed = base64UrlEncodeNoPad(digest.copyOfRange(0, 16))
+        if (computed != atHash) {
+            throw IdTokenVerificationException(IdTokenVerifyError.AT_HASH_MISMATCH)
+        }
+    }
+
     return VerifiedIdToken(sub, payload)
 }
 
 // MARK: - Helpers
 
 private fun verifyRs256(signingInput: String, signature: ByteArray, jwk: Jwk): Boolean {
-    val modulusBytes = base64UrlDecode(jwk.n) ?: return false
-    val exponentBytes = base64UrlDecode(jwk.e) ?: return false
+    val modulusBytes = jwk.n?.let { base64UrlDecode(it) } ?: return false
+    val exponentBytes = jwk.e?.let { base64UrlDecode(it) } ?: return false
     return try {
         val spec = RSAPublicKeySpec(BigInteger(1, modulusBytes), BigInteger(1, exponentBytes))
         val publicKey = KeyFactory.getInstance("RSA").generatePublic(spec)
@@ -203,9 +236,33 @@ private fun audienceMatches(aud: kotlinx.serialization.json.JsonElement?, client
  * neither android.util.Base64 (unavailable in JVM unit tests) nor
  * java.util.Base64 (API 26+). Returns null on any invalid character.
  */
+private const val B64URL_ALPHABET =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
 private val B64URL_LOOKUP: IntArray = IntArray(128) { -1 }.also { table ->
-    val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-    for (i in alphabet.indices) table[alphabet[i].code] = i
+    for (i in B64URL_ALPHABET.indices) table[B64URL_ALPHABET[i].code] = i
+}
+
+/**
+ * bytes → base64url without padding. Pure implementation (no android.util.Base64
+ * / java.util.Base64) to match [base64UrlDecode] and run in plain JVM tests.
+ */
+private fun base64UrlEncodeNoPad(bytes: ByteArray): String {
+    val sb = StringBuilder((bytes.size + 2) / 3 * 4)
+    var i = 0
+    while (i < bytes.size) {
+        val b0 = bytes[i].toInt() and 0xFF
+        val hasB1 = i + 1 < bytes.size
+        val hasB2 = i + 2 < bytes.size
+        val b1 = if (hasB1) bytes[i + 1].toInt() and 0xFF else 0
+        val b2 = if (hasB2) bytes[i + 2].toInt() and 0xFF else 0
+        sb.append(B64URL_ALPHABET[b0 shr 2])
+        sb.append(B64URL_ALPHABET[((b0 and 0x03) shl 4) or (b1 shr 4)])
+        if (hasB1) sb.append(B64URL_ALPHABET[((b1 and 0x0F) shl 2) or (b2 shr 6)])
+        if (hasB2) sb.append(B64URL_ALPHABET[b2 and 0x3F])
+        i += 3
+    }
+    return sb.toString()
 }
 
 private fun base64UrlDecode(input: String): ByteArray? {

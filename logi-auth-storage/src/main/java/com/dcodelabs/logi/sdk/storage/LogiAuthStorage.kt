@@ -1,6 +1,7 @@
 package com.dcodelabs.logi.sdk.storage
 
 import android.content.Context
+import com.dcodelabs.logi.sdk.LogiAuth
 import com.dcodelabs.logi.sdk.LogiAuthConfig
 import com.dcodelabs.logi.sdk.LogiAuthError
 import com.dcodelabs.logi.sdk.LogiAuthResult
@@ -77,6 +78,21 @@ class LogiAuthStorage(
 
         return runCatching {
             val result = postRefresh(refreshToken)
+            // A3: a rotated id_token is untrusted input just like the sign-in
+            // one — re-verify its signature + claims (no nonce on refresh)
+            // BEFORE persisting, so a forged/mismatched id_token can never
+            // reach durable state that currentIdToken() would later read. Reuses
+            // the SDK's JWKS fetch + rotation-retry path (no duplication). A
+            // failure throws → runCatching → Result.failure, nothing persisted.
+            result.idToken?.let { rotatedIdToken ->
+                LogiAuth.verifyRefreshedIdToken(
+                    idToken = rotatedIdToken,
+                    accessToken = result.accessToken,
+                    issuer = config.issuer,
+                    tokenIssuer = config.tokenIssuer,
+                    clientId = config.clientId,
+                )
+            }
             store.accessToken = result.accessToken
             result.refreshToken?.let { store.refreshToken = it }
             result.idToken?.let { store.idToken = it }
