@@ -55,9 +55,9 @@ afterEvaluate {
         publications {
             create<MavenPublication>("release") {
                 from(components["release"])
-                groupId = "com.github.dcode-co"
+                groupId = "com.github.dcode-co.logi-auth-android"
                 artifactId = "logi-auth-android"
-                version = "1.0.3"
+                version = "1.0.4"
                 pom {
                     name.set("logi-auth-android")
                     licenses {
