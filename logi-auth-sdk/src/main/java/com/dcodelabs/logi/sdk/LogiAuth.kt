@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.browser.customtabs.CustomTabsIntent
 import com.dcodelabs.logi.sdk.internal.IdTokenVerificationException
@@ -20,6 +21,8 @@ import com.dcodelabs.logi.sdk.internal.VerifiedIdToken
 import com.dcodelabs.logi.sdk.internal.VerifyExpected
 import com.dcodelabs.logi.sdk.internal.verifyIdToken
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
@@ -56,10 +59,59 @@ object LogiAuth {
     /** Package name of the logi Android app — pinned for app-to-app handoff. */
     private const val LOGI_APP_PACKAGE = "com.dcodelabs.logi"
 
+    /**
+     * How long to wait for the app-to-app handoff to take the foreground before
+     * concluding the platform swallowed it.
+     *
+     * Safe to keep short because the signal we wait for is the *starting
+     * window*, not a loaded app: Android shows the target's splash surface
+     * before its process finishes initializing, which stops our Activity and
+     * sets [sawBackgroundSinceLaunch]. Measured at ~80ms for a cold start of
+     * the logi app on a mid-range device (START → splash surface), so 2.5s is
+     * ~30x headroom and a slow cold start will not be mistaken for an abort.
+     */
+    private const val HANDOFF_FOREGROUND_TIMEOUT_MS = 2_500L
+
     private var config: LogiAuthConfig? = null
     private var appContext: Context? = null
     private var pendingSignIn: CompletableDeferred<Result<LogiSession>>? = null
     private var pendingSignInLaunchedAt: Long = 0L
+
+    /**
+     * Set when our whole app goes to the background after [signIn] launched the
+     * authorization surface — i.e. proof that *something* (the logi app or a
+     * Custom Tab) actually took the foreground.
+     *
+     * Needed because `startActivity()` returning normally does NOT mean the
+     * target Activity started: when the framework aborts a launch under the
+     * background-activity-launch (BAL) rules it reports `START_ABORTED`
+     * internally but hands the caller `START_SUCCESS` (AOSP ActivityStarter).
+     * Without this flag a silently-aborted handoff is indistinguishable from a
+     * successful one, which cost us both the Custom Tabs fallback and an
+     * honest error. (2026-07-28, logi focus on MIUI/Android 15: re-using the
+     * already-present logi app task was aborted this way and surfaced as
+     * "User cancelled the OAuth flow.")
+     *
+     * Deliberately keyed on the started-Activity count reaching zero rather
+     * than on any single Activity pausing: an in-app screen transition pauses
+     * one Activity while starting another, and a configuration change tears one
+     * down only to rebuild it. Neither means we lost the foreground, and
+     * treating them as handoff proof would re-introduce the very bug this
+     * guards against. (codex review P2, 2026-07-28.)
+     */
+    @Volatile private var sawBackgroundSinceLaunch: Boolean = false
+
+    /** Started (visible-lifecycle) Activity count — zero means backgrounded. */
+    private var startedActivities: Int = 0
+
+    /** Authorize URL of the in-flight sign-in, kept for the deferred fallback. */
+    @Volatile private var pendingAuthorizeUri: Uri? = null
+
+    /** Whether the current sign-in went out via the app-to-app path. */
+    @Volatile private var nativeHandoffAttempted: Boolean = false
+
+    /** Guards the deferred Custom Tabs fallback so it fires at most once. */
+    @Volatile private var fallbackLaunched: Boolean = false
 
     /** In-memory JWKS cache (issuer, keys, fetchedAtMillis). Rare rotation, so
      *  a 1h window avoids a round-trip per sign-in; unknown_kid busts it. */
@@ -140,6 +192,7 @@ object LogiAuth {
         val deferred = CompletableDeferred<Result<LogiSession>>()
         pendingSignIn = deferred
         pendingSignInLaunchedAt = System.currentTimeMillis()
+        sawBackgroundSinceLaunch = false
 
         // First-try app-to-app handoff (mirrors iOS LogiAuth's
         // universalLinksOnly path + Kakao/Naver SDK pattern). If the logi
@@ -147,18 +200,38 @@ object LogiAuth {
         // Intent.setPackage so the system doesn't show a chooser. On
         // failure (not installed, intent filter mismatch, ActivityNotFound)
         // fall back to Custom Tabs.
-        if (!tryNativeHandoff(activity, authorizeUri)) {
+        //
+        // tryNativeHandoff() returning true only means startActivity() didn't
+        // throw — the framework silently converts BAL-aborted launches into a
+        // success result. We deliberately do NOT race that with a timeout: a
+        // cold-starting logi app can take arbitrarily long to become visible,
+        // and launching a browser meanwhile would leave two competing
+        // authorization surfaces for one request. Instead the fallback is
+        // deferred to the lifecycle callback, which fires only once we know the
+        // user is back on our screen with nothing ever having taken the
+        // foreground. (codex review P1, 2026-07-28.)
+        pendingAuthorizeUri = authorizeUri
+        fallbackLaunched = false
+        nativeHandoffAttempted = tryNativeHandoff(activity, authorizeUri)
+        // A swallowed launch leaves the caller resumed, so no lifecycle
+        // transition ever fires — the deferred fallback below cannot be the only
+        // trigger or signIn() would hang forever. (codex review P1, 2026-07-28.)
+        // Waiting on the starting window rather than a loaded app keeps this
+        // from cutting a legitimately slow cold start short; see
+        // [HANDOFF_FOREGROUND_TIMEOUT_MS].
+        val canDetectHandoffFailure = (activity as? Activity)?.inMultiWindow() != true
+        val needsFallback = !nativeHandoffAttempted ||
+            canDetectHandoffFailure && !awaitForegroundHandoff() && claimFallback()
+        if (needsFallback) {
             try {
-                CustomTabsIntent.Builder()
-                    .setShowTitle(true)
-                    .build()
-                    .launchUrl(activity, authorizeUri)
+                launchCustomTab(activity, authorizeUri)
             } catch (e: ActivityNotFoundException) {
                 // No browser / Custom Tabs handler installed. Clean up the
                 // suspended state so this call doesn't hang forever, then
                 // surface the failure. (codex review 2026-05-18: regression
                 // risk if we leave pendingSignIn set.)
                 pendingSignIn = null
+                pendingAuthorizeUri = null
                 store.pkceVerifier = null
                 store.pendingState = null
                 store.pendingNonce = null
@@ -183,6 +256,48 @@ object LogiAuth {
      * app needs `<queries><package android:name="com.dcodelabs.logi" />`
      * in its AndroidManifest — documented in the SDK README.)
      */
+    /**
+     * Wait for evidence that the app-to-app handoff took the foreground: our
+     * app backgrounding. False on timeout ⇒ the launch was swallowed.
+     *
+     * A poll loop rather than a suspending signal because the lifecycle
+     * callback fires on the main thread while this runs on the caller's
+     * coroutine; the flag is @Volatile and the window is short.
+     */
+    private suspend fun awaitForegroundHandoff(): Boolean =
+        withTimeoutOrNull(HANDOFF_FOREGROUND_TIMEOUT_MS) {
+            while (!sawBackgroundSinceLaunch) delay(50L)
+            true
+        } ?: false
+
+    /**
+     * Backgrounding is only a meaningful signal when windows are exclusive. In
+     * split-screen / freeform the logi app can open beside us with every RP
+     * Activity still started, so absence of backgrounding proves nothing and we
+     * must not "recover" a handoff that in fact succeeded — that would put two
+     * authorization surfaces on one state/PKCE request. We forgo the fallback
+     * there and keep the pre-existing behavior. (codex review P2, 2026-07-28.)
+     */
+    private fun Activity.inMultiWindow(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInMultiWindowMode
+
+    /**
+     * Claim the one-shot fallback. Both the timeout path and the lifecycle path
+     * can reach this concurrently (different threads), so the check-and-set is
+     * guarded — otherwise a race opens two Custom Tabs for one request.
+     */
+    private fun claimFallback(): Boolean = synchronized(this) {
+        if (fallbackLaunched) false else { fallbackLaunched = true; true }
+    }
+
+    /** Open the authorize URL in a Custom Tab. Throws if no browser handles it. */
+    private fun launchCustomTab(context: Context, authorizeUri: Uri) {
+        CustomTabsIntent.Builder()
+            .setShowTitle(true)
+            .build()
+            .launchUrl(context, authorizeUri)
+    }
+
     private fun tryNativeHandoff(context: Context, authorizeUri: Uri): Boolean {
         if (!isLogiAppInstalled(context)) return false
         return try {
@@ -310,6 +425,7 @@ object LogiAuth {
             store.pendingState = null
             store.pendingNonce = null
             pendingSignIn = null
+            pendingAuthorizeUri = null
             callbackInFlight = false
         }
     }
@@ -407,16 +523,57 @@ object LogiAuth {
                 if (activity is LogiAuthCallbackActivity) return  // success path
                 if (callbackInFlight) return  // token exchange racing in IO
                 val deferred = pendingSignIn ?: return
+                // Never backgrounded since launch ⇒ no authorization surface was
+                // ever shown, so the user cannot have cancelled one. The native
+                // handoff was swallowed by the platform (see
+                // [sawBackgroundSinceLaunch]); recover by opening the browser
+                // now — at this point we know nothing else is competing for the
+                // request. Keep the sign-in suspended rather than failing it.
+                // Scoped to the un-fallen-back native handoff on purpose. Once
+                // we're on the browser path — whether from the start or via the
+                // fallback — a still-visible RP is normal (multi-window, partial
+                // Custom Tab), so gating on backgrounding there would strand the
+                // sign-in and poison later ones with AlreadyInProgress.
+                // (codex review P2, 2026-07-28.)
+                if (nativeHandoffAttempted && !fallbackLaunched &&
+                    !sawBackgroundSinceLaunch && !activity.inMultiWindow()
+                ) {
+                    val uri = pendingAuthorizeUri
+                    if (uri != null && claimFallback()) {
+                        runCatching { launchCustomTab(activity, uri) }.onFailure {
+                            deferred.complete(Result.failure(LogiAuthError.Network(it)))
+                            pendingStore()?.clear()
+                            pendingSignIn = null
+                            pendingAuthorizeUri = null
+                        }
+                    }
+                    return
+                }
                 val elapsed = System.currentTimeMillis() - pendingSignInLaunchedAt
                 if (elapsed < 500L) return  // pre-Custom-Tabs resume; ignore
                 deferred.complete(Result.failure(LogiAuthError.UserCancelled))
                 pendingStore()?.clear()
                 pendingSignIn = null
+                pendingAuthorizeUri = null
             }
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
-            override fun onActivityStarted(activity: Activity) {}
+            override fun onActivityStarted(activity: Activity) {
+                startedActivities++
+            }
             override fun onActivityPaused(activity: Activity) {}
-            override fun onActivityStopped(activity: Activity) {}
+            override fun onActivityStopped(activity: Activity) {
+                startedActivities = (startedActivities - 1).coerceAtLeast(0)
+                // Zero started Activities = we lost the foreground to whatever
+                // we just launched. A stop that is only a configuration-change
+                // rebuild does not count. Gated on an in-flight sign-in so
+                // unrelated backgrounding doesn't arm the cancel detector.
+                if (startedActivities == 0 &&
+                    !activity.isChangingConfigurations &&
+                    pendingSignIn != null
+                ) {
+                    sawBackgroundSinceLaunch = true
+                }
+            }
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
             override fun onActivityDestroyed(activity: Activity) {}
         })
