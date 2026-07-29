@@ -1,4 +1,6 @@
 jdk:
   - openjdk17
 install:
-  - ./gradlew :logi-auth-sdk:publishToMavenLocal
+  # 두 모듈 모두 발행한다. 1.0.0 에서 토큰 영속/refresh 가 코어에서 분리돼
+  # :logi-auth-storage 로 옮겨졌으므로, sdk 만 올리면 RP 는 그 API 를 받을 수 없다.
+  - ./gradlew :logi-auth-sdk:publishToMavenLocal :logi-auth-storage:publishToMavenLocal

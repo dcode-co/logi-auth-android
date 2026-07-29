@@ -43,7 +43,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.dcode-co"
                 artifactId = "logi-auth-storage"
-                version = "0.2.2"
+                version = "1.0.3"
                 pom {
                     name.set("logi-auth-storage")
                     licenses {
