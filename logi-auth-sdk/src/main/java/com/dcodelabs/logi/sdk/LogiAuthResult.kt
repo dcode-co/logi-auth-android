@@ -79,6 +79,23 @@ sealed class LogiAuthError(message: String, cause: Throwable? = null) : RuntimeE
         "OAuth state parameter did not match — possible CSRF / hijack."
     )
     object UserCancelled : LogiAuthError("User cancelled the OAuth flow.")
+
+    /**
+     * No authorization callback arrived before the SDK's wait deadline (5
+     * minutes). Mirrors iOS `LogiAuthError.handoffTimeout`.
+     *
+     * Normally means the user left the authorization surface without finishing.
+     * It is also the only way a split-screen / freeform flow can end: there the
+     * RP Activity is never stopped or resumed while the logi app sits beside it,
+     * so nothing else ever tells the SDK the login was abandoned.
+     *
+     * Treat it like [UserCancelled] in the UI — offer the login button again.
+     * The flow is fully released, so the retry is accepted rather than rejected
+     * with [AlreadyInProgress].
+     */
+    object HandoffTimeout : LogiAuthError(
+        "Timed out waiting for the authorization callback — the user never returned."
+    )
     object AlreadyInProgress : LogiAuthError(
         "A signIn() call is already in progress — await or cancel the previous one first."
     )
