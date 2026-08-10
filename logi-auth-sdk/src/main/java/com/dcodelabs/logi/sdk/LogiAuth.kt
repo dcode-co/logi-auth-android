@@ -74,8 +74,89 @@ object LogiAuth {
 
     private var config: LogiAuthConfig? = null
     private var appContext: Context? = null
-    private var pendingSignIn: CompletableDeferred<Result<LogiSession>>? = null
+    // @Volatile like every other cross-thread field here: written from the
+    // callback coroutine (Dispatchers.IO) and read by the Activity lifecycle
+    // callbacks on the main thread. These two were the only ones missing it.
+    @Volatile private var pendingSignIn: CompletableDeferred<Result<LogiSession>>? = null
     private var pendingSignInLaunchedAt: Long = 0L
+
+    /**
+     * The [authorize] counterpart to [pendingSignIn]. Only one of the two is
+     * ever set: both drive the same launch surface, the same callback Activity,
+     * and the same cancel detector, so they must serialize against each other —
+     * see [anyFlowPending].
+     */
+    @Volatile private var pendingAuthorize: CompletableDeferred<Result<LogiCallback>>? = null
+
+    /**
+     * True while either flow is awaiting a callback. Every guard and every
+     * lifecycle hook must ask this rather than testing one slot: a check that
+     * saw only [pendingSignIn] would let an [authorize] run alongside a
+     * [signIn], and the second launch would overwrite the first's
+     * [pendingAuthorizeUri] and strand it forever.
+     */
+    private fun anyFlowPending(): Boolean = pendingSignIn != null || pendingAuthorize != null
+
+    /**
+     * Claim the single-flight slot for a [signIn], or report that something else
+     * holds it. Check-and-set must be atomic: with two entry points, `signIn`
+     * and `authorize` starting on different coroutines could both read
+     * [anyFlowPending] as false before either assigned its slot, then launch
+     * competing flows over one [pendingAuthorizeUri]. The callback prioritizes
+     * [pendingAuthorize], so the loser's deferred would never resolve.
+     * (codex review P1, 2026-08-10.) Same lock as [claimFallback].
+     */
+    private fun claimSignIn(
+        deferred: CompletableDeferred<Result<LogiSession>>,
+        setUpFlowState: () -> Unit,
+    ): Boolean = synchronized(this) {
+        if (anyFlowPending()) return@synchronized false
+        // Persist the flow's state BEFORE publishing the slot. A callback that
+        // observed a claimed slot with no `pendingState` written yet would fail
+        // the state check, clear the slot, and make the real callback arrive to
+        // nothing. Setup throwing here (encrypted prefs unavailable, say) leaves
+        // the slot unclaimed rather than jamming every later flow with
+        // AlreadyInProgress. (codex review P2, 2026-08-10.)
+        setUpFlowState()
+        pendingSignIn = deferred
+        true
+    }
+
+    /** [claimSignIn] for the backend-led flow. */
+    private fun claimAuthorize(
+        deferred: CompletableDeferred<Result<LogiCallback>>,
+        setUpFlowState: () -> Unit,
+    ): Boolean = synchronized(this) {
+        if (anyFlowPending()) return@synchronized false
+        setUpFlowState()
+        pendingAuthorize = deferred
+        true
+    }
+
+    /**
+     * Complete whichever flow is in flight with [error] and clear both slots.
+     * Used by the cancel detector, which has no idea which kind it interrupted.
+     */
+    /**
+     * Drop the pending slot and the shared launch state it owns, under the same
+     * lock [claimSignIn] / [claimAuthorize] take. Doing it with plain
+     * assignments let a concurrent `authorize()` claim a new flow and publish
+     * its [pendingAuthorizeUri] between two of them, after which the finishing
+     * callback nulled the NEW flow's URI and the lifecycle fallback had nothing
+     * to recover. (codex review P2, 2026-08-10.)
+     */
+    private fun releasePendingFlow() = synchronized(this) {
+        pendingSignIn = null
+        pendingAuthorize = null
+        pendingAuthorizeUri = null
+    }
+
+    private fun failPendingFlow(error: LogiAuthError) {
+        pendingSignIn?.complete(Result.failure(error))
+        pendingAuthorize?.complete(Result.failure(error))
+        pendingSignIn = null
+        pendingAuthorize = null
+    }
 
     /**
      * Set when our whole app goes to the background after [signIn] launched the
@@ -152,6 +233,99 @@ object LogiAuth {
      * (Codex flagged this on the Phase 3 internal app where an Application
      * context here threw AndroidRuntimeException.)
      */
+    /**
+     * Open an authorization Uri that the RP's **backend** built, and hand back
+     * only `{ code, state }`. The low-level primitive behind the backend-led
+     * (BFF) flow, for RPs registered as `client_type=confidential`.
+     *
+     * [signIn] cannot serve those RPs: it does the token exchange inside the
+     * app, which would require shipping `client_secret` in the APK. This splits
+     * the flow so the secret and the PKCE verifier never leave the RP's server.
+     *
+     * ```kotlin
+     * // 1. RP backend mints the transaction and the authorize Uri
+     * val start = myBackend.startLogiSignIn()
+     *
+     * // 2. SDK opens it and recovers the callback — this call
+     * val cb = LogiAuth.authorize(activity, Uri.parse(start.authorizeUrl)).getOrThrow()
+     *
+     * // 3. RP backend exchanges the code and issues its own session
+     * myBackend.completeLogiSignIn(start.txnId, cb.code, cb.state)
+     * ```
+     *
+     * [startUri] is logi's `/oauth/authorize` Uri — **not** the RP backend's
+     * `/start` endpoint. Calling `/start` is the RP app's job, with its own HTTP
+     * client; the SDK never talks to the RP backend.
+     *
+     * The SDK generates **no** PKCE verifier, state, or nonce here — the backend
+     * owns all three, and generating them in the app would put the verifier back
+     * on the device. `state` is read out of [startUri] purely to match the
+     * callback against this flow.
+     *
+     * Same single-flight rule and the same launch handling as [signIn]:
+     * app-to-app handoff first, Custom Tabs fallback, and the same cancel
+     * detector. Pass an Activity context — Custom Tabs requires it.
+     *
+     * **Does not survive process death.** The suspended call lives in memory, so
+     * if Android kills the app while the authorization surface is open, this
+     * call dies with it and the returning callback finds nothing to resolve.
+     * The recovery is a fresh `/start`: the RP backend owns the transaction, and
+     * abandoning one costs nothing but its TTL. [signIn] has the same limit —
+     * treat a login that never returns as a login to retry, not as one to
+     * resume. Do not persist the code or state to work around this; that would
+     * put a live authorization code in app storage.
+     */
+    @JvmStatic
+    suspend fun authorize(
+        activity: Context,
+        startUri: Uri,
+    ): Result<LogiCallback> {
+        // `state` comes from the backend, embedded in the Uri it built. Read it
+        // back so the callback can be matched to this flow — the SDK is not
+        // generating or validating it as a credential, only using it to tell
+        // this flow's callback from a stale or injected one.
+        //
+        // Checked before the config lookup and before the pending slot is armed
+        // so a rejected argument never holds the single-flight lock — that would
+        // block every later flow with AlreadyInProgress.
+        val state = runCatching { startUri.getQueryParameter("state") }.getOrNull()
+        if (state.isNullOrEmpty()) return Result.failure(LogiAuthError.MissingStateInStartUri)
+
+        val store = pendingStore() ?: return Result.failure(LogiAuthError.NotConfigured)
+
+        val deferred = CompletableDeferred<Result<LogiCallback>>()
+        val claimed = claimAuthorize(deferred) {
+            // The callback handler compares against this. No verifier and no
+            // nonce are stored: both belong to the backend in this flow, and
+            // leaving a stale one here would make the signIn() path read it.
+            store.pkceVerifier = null
+            store.pendingNonce = null
+            store.pendingState = state
+        }
+        if (!claimed) return Result.failure(LogiAuthError.AlreadyInProgress)
+
+        pendingSignInLaunchedAt = System.currentTimeMillis()
+        sawBackgroundSinceLaunch = false
+
+        // A cancelled caller must not leave the slot claimed: the next call
+        // would get AlreadyInProgress forever, and a late callback would target
+        // an orphaned flow. The window starts at the launch, not at the await —
+        // `launchAuthorizationSurface` suspends while waiting for the native
+        // handoff, and a cancellation there never reaches the await.
+        // (codex review P2, 2026-08-10.)
+        try {
+            val launchError = launchAuthorizationSurface(activity, startUri)
+            if (launchError != null) return Result.failure(launchError)
+            return deferred.await()
+        } finally {
+            if (pendingAuthorize === deferred) {
+                pendingAuthorize = null
+                pendingAuthorizeUri = null
+                store.pendingState = null
+            }
+        }
+    }
+
     @JvmStatic
     suspend fun signIn(
         activity: Context,
@@ -164,8 +338,8 @@ object LogiAuth {
         // LogiAuthError.alreadyInProgress. Without this guard, a second
         // signIn() overwrites pendingSignIn and strands the first deferred
         // forever. (codex P1, 2026-05-18.)
-        if (pendingSignIn != null) return Result.failure(LogiAuthError.AlreadyInProgress)
-
+        // Generated before the claim: these touch no shared state, so a failure
+        // here cannot leave the single-flight slot stuck.
         val verifier = Pkce.generateVerifier()
         val challenge = Pkce.s256Challenge(verifier)
         val state = Pkce.randomState()
@@ -173,9 +347,14 @@ object LogiAuth {
         // to this specific authorize request (replay defense). Server echoes it
         // through authorize → grant → id_token (id_token_issuer.rb).
         val nonce = Pkce.randomNonce()
-        store.pkceVerifier = verifier
-        store.pendingState = state
-        store.pendingNonce = nonce
+
+        val deferred = CompletableDeferred<Result<LogiSession>>()
+        val claimed = claimSignIn(deferred) {
+            store.pkceVerifier = verifier
+            store.pendingState = state
+            store.pendingNonce = nonce
+        }
+        if (!claimed) return Result.failure(LogiAuthError.AlreadyInProgress)
 
         val authorizeUri = Uri.parse(cfg.issuer.trimEnd('/') + "/oauth/authorize")
             .buildUpon()
@@ -189,8 +368,6 @@ object LogiAuth {
             .appendQueryParameter("code_challenge_method", "S256")
             .build()
 
-        val deferred = CompletableDeferred<Result<LogiSession>>()
-        pendingSignIn = deferred
         pendingSignInLaunchedAt = System.currentTimeMillis()
         sawBackgroundSinceLaunch = false
 
@@ -210,36 +387,23 @@ object LogiAuth {
         // deferred to the lifecycle callback, which fires only once we know the
         // user is back on our screen with nothing ever having taken the
         // foreground. (codex review P1, 2026-07-28.)
-        pendingAuthorizeUri = authorizeUri
-        fallbackLaunched = false
-        nativeHandoffAttempted = tryNativeHandoff(activity, authorizeUri)
-        // A swallowed launch leaves the caller resumed, so no lifecycle
-        // transition ever fires — the deferred fallback below cannot be the only
-        // trigger or signIn() would hang forever. (codex review P1, 2026-07-28.)
-        // Waiting on the starting window rather than a loaded app keeps this
-        // from cutting a legitimately slow cold start short; see
-        // [HANDOFF_FOREGROUND_TIMEOUT_MS].
-        val canDetectHandoffFailure = (activity as? Activity)?.inMultiWindow() != true
-        val needsFallback = !nativeHandoffAttempted ||
-            canDetectHandoffFailure && !awaitForegroundHandoff() && claimFallback()
-        if (needsFallback) {
-            try {
-                launchCustomTab(activity, authorizeUri)
-            } catch (e: ActivityNotFoundException) {
-                // No browser / Custom Tabs handler installed. Clean up the
-                // suspended state so this call doesn't hang forever, then
-                // surface the failure. (codex review 2026-05-18: regression
-                // risk if we leave pendingSignIn set.)
+        // Same cancellation cleanup as authorize() — see the comment there. The
+        // finally also covers the "no browser installed" failure, which
+        // previously needed its own hand-written teardown. (codex review
+        // 2026-05-18: regression risk if we leave pendingSignIn set.)
+        try {
+            val launchError = launchAuthorizationSurface(activity, authorizeUri)
+            if (launchError != null) return Result.failure(launchError)
+            return deferred.await()
+        } finally {
+            if (pendingSignIn === deferred) {
                 pendingSignIn = null
                 pendingAuthorizeUri = null
                 store.pkceVerifier = null
                 store.pendingState = null
                 store.pendingNonce = null
-                return Result.failure(LogiAuthError.Network(e))
             }
         }
-
-        return deferred.await()
     }
 
     /**
@@ -256,6 +420,45 @@ object LogiAuth {
      * app needs `<queries><package android:name="com.dcodelabs.logi" />`
      * in its AndroidManifest — documented in the SDK README.)
      */
+    /**
+     * Open the authorization surface: app-to-app handoff first, Custom Tabs as
+     * the fallback. Returns null on success, or the error to fail the caller
+     * with. Shared by [signIn] and [authorize] — both need the identical
+     * BAL-abort recovery, and duplicating it would let the two drift.
+     *
+     * The caller must have armed the pending slot, [pendingSignInLaunchedAt],
+     * and [sawBackgroundSinceLaunch] *before* calling this: the swallowed-launch
+     * detection below reads them.
+     *
+     * `tryNativeHandoff()` returning true only means startActivity() didn't
+     * throw — the framework silently converts BAL-aborted launches into a
+     * success result. A swallowed launch leaves the caller resumed, so no
+     * lifecycle transition ever fires and the deferred fallback in the cancel
+     * detector cannot be the only trigger, or the flow would hang forever.
+     * (codex review P1, 2026-07-28.) Waiting on the *starting window* rather
+     * than a loaded app keeps this from cutting a legitimately slow cold start
+     * short; see [HANDOFF_FOREGROUND_TIMEOUT_MS].
+     */
+    private suspend fun launchAuthorizationSurface(
+        activity: Context,
+        authorizeUri: Uri,
+    ): LogiAuthError? {
+        pendingAuthorizeUri = authorizeUri
+        fallbackLaunched = false
+        nativeHandoffAttempted = tryNativeHandoff(activity, authorizeUri)
+        val canDetectHandoffFailure = (activity as? Activity)?.inMultiWindow() != true
+        val needsFallback = !nativeHandoffAttempted ||
+            canDetectHandoffFailure && !awaitForegroundHandoff() && claimFallback()
+        if (needsFallback) {
+            try {
+                launchCustomTab(activity, authorizeUri)
+            } catch (e: ActivityNotFoundException) {
+                return LogiAuthError.Network(e)
+            }
+        }
+        return null
+    }
+
     /**
      * Wait for evidence that the app-to-app handoff took the foreground: our
      * app backgrounding. False on timeout ⇒ the launch was swallowed.
@@ -351,39 +554,110 @@ object LogiAuth {
      * Public so RPs that prefer to write their own callback Activity can
      * forward the redirect Uri here rather than using the SDK's built-in
      * Activity.
+     *
+     * **If you write your own callback Activity, set [callbackInFlight] to true
+     * synchronously in `onCreate` before launching this suspend function.**
+     * This function sets it at entry, but a coroutine dispatch can land after
+     * your Activity finishes and the RP Activity resumes — and in that window
+     * the cancel detector will read a valid return as a dismissal and complete
+     * the flow with [LogiAuthError.UserCancelled]. [LogiAuthCallbackActivity]
+     * does exactly this; mirror it. (codex review, 2026-08-10.)
      */
     @JvmStatic
     suspend fun handleAuthorizationCallback(callbackUri: Uri) {
+        // [LogiAuthCallbackActivity] sets this before finish() so the cancel
+        // detector cannot mistake a landing callback for a dismissal. Every exit
+        // from here must clear it, including the early returns below — a stuck
+        // flag would disable cancel detection for the rest of the process.
+        // Set at entry, not inside the branches: RPs are documented to write
+        // their own callback Activity and call this directly, and those never
+        // touch [LogiAuthCallbackActivity]'s synchronous claim. Without it the
+        // cancel detector can classify a landing callback as a dismissal.
+        // (codex review P2, 2026-08-10.)
+        callbackInFlight = true
+        try {
+            handleAuthorizationCallbackInner(callbackUri)
+        } finally {
+            callbackInFlight = false
+        }
+    }
+
+    private suspend fun handleAuthorizationCallbackInner(callbackUri: Uri) {
         val cfg = config ?: return
         val store = pendingStore() ?: return
+
+        // Backend-led flow: hand the pair straight back. No token exchange and
+        // no id_token verification here — the RP backend owns both, and doing
+        // either would need the verifier or the client_secret on the device.
+        val authorizeDeferred = pendingAuthorize
+        if (authorizeDeferred != null) {
+            callbackInFlight = true
+            // Compute the outcome first, tear down second, resume the caller
+            // last. Two reasons, both found by codex review (2026-08-10):
+            //   - `getQueryParameter` throws on an opaque or malformed Uri. If
+            //     that escaped, the teardown still ran but nothing ever
+            //     completed the deferred, so the caller hung forever.
+            //   - completing the deferred can resume the awaiting coroutine
+            //     immediately. If it starts another authorize() right away, a
+            //     teardown running afterwards would wipe the NEW flow's
+            //     pendingState and its callback would fail with StateMismatch.
+            val outcome: Result<LogiCallback> = try {
+                // State first. `state` is the only thing tying a callback to
+                // this flow, so nothing acts on the callback until it matches —
+                // otherwise an unsolicited `?error=access_denied&state=wrong`
+                // aborts a live flow.
+                val state = callbackUri.getQueryParameter("state")
+                val error = callbackUri.getQueryParameter("error")
+                val code = callbackUri.getQueryParameter("code")
+                when {
+                    state == null || state != store.pendingState ->
+                        Result.failure(LogiAuthError.StateMismatch)
+                    error != null -> {
+                        val message = callbackUri.getQueryParameter("error_description") ?: error
+                        Result.failure(
+                            if (error == "access_denied") LogiAuthError.UserCancelled
+                            else LogiAuthError.TokenEndpoint(message)
+                        )
+                    }
+                    code == null -> Result.failure(LogiAuthError.InvalidAuthorizeUrl)
+                    else -> Result.success(LogiCallback(code = code, state = state))
+                }
+            } catch (e: LogiAuthError) {
+                Result.failure(e)
+            } catch (e: Throwable) {
+                Result.failure(LogiAuthError.Network(e))
+            }
+
+            store.pendingState = null
+            releasePendingFlow()
+            authorizeDeferred.complete(outcome)
+            return
+        }
+
         val deferred = pendingSignIn ?: return  // not awaiting any sign-in
 
         callbackInFlight = true  // suppress the cancel-detector race
-        try {
+        // Same shape as the authorize branch: compute the outcome, tear down,
+        // then resume the caller. Completing first lets the resumed coroutine
+        // start another sign-in whose state the teardown would then erase.
+        // (codex review P2, 2026-08-10.)
+        val outcome: Result<LogiSession> = try {
+            // State first — same reasoning as the branch above: an injected
+            // error callback must not be able to abort a live sign-in.
+            val state = callbackUri.getQueryParameter("state")
             val error = callbackUri.getQueryParameter("error")
+            val code = callbackUri.getQueryParameter("code")
+            val verifier = store.pkceVerifier
+            if (state == null || state != store.pendingState) {
+                throw LogiAuthError.StateMismatch
+            }
             if (error != null) {
                 val message = callbackUri.getQueryParameter("error_description") ?: error
-                deferred.complete(Result.failure(
-                    if (error == "access_denied") LogiAuthError.UserCancelled
-                    else LogiAuthError.TokenEndpoint(message)
-                ))
-                return
+                throw if (error == "access_denied") LogiAuthError.UserCancelled
+                      else LogiAuthError.TokenEndpoint(message)
             }
-
-            val code = callbackUri.getQueryParameter("code")
-            if (code == null) {
-                deferred.complete(Result.failure(LogiAuthError.InvalidAuthorizeUrl))
-                return
-            }
-            val state = callbackUri.getQueryParameter("state")
-            if (state != store.pendingState) {
-                deferred.complete(Result.failure(LogiAuthError.StateMismatch))
-                return
-            }
-            val verifier = store.pkceVerifier
-            if (verifier == null) {
-                deferred.complete(Result.failure(LogiAuthError.InvalidAuthorizeUrl))
-                return
+            if (code == null || verifier == null) {
+                throw LogiAuthError.InvalidAuthorizeUrl
             }
 
             val result = TokenExchange(cfg.issuer)
@@ -415,19 +689,18 @@ object LogiAuth {
                 scope = result.scope,
                 expiresInSec = result.expiresInSec,
             )
-            deferred.complete(Result.success(session))
+            Result.success(session)
         } catch (e: LogiAuthError) {
-            deferred.complete(Result.failure(e))
+            Result.failure(e)
         } catch (e: Throwable) {
-            deferred.complete(Result.failure(LogiAuthError.Network(e)))
-        } finally {
-            store.pkceVerifier = null
-            store.pendingState = null
-            store.pendingNonce = null
-            pendingSignIn = null
-            pendingAuthorizeUri = null
-            callbackInFlight = false
+            Result.failure(LogiAuthError.Network(e))
         }
+
+        store.pkceVerifier = null
+        store.pendingState = null
+        store.pendingNonce = null
+        releasePendingFlow()
+        deferred.complete(outcome)
     }
 
     /**
@@ -522,7 +795,10 @@ object LogiAuth {
             override fun onActivityResumed(activity: Activity) {
                 if (activity is LogiAuthCallbackActivity) return  // success path
                 if (callbackInFlight) return  // token exchange racing in IO
-                val deferred = pendingSignIn ?: return
+                // Either flow can be the one interrupted — an abandoned
+                // authorize() must not hang any more than an abandoned
+                // signIn(). See [anyFlowPending].
+                if (!anyFlowPending()) return
                 // Never backgrounded since launch ⇒ no authorization surface was
                 // ever shown, so the user cannot have cancelled one. The native
                 // handoff was swallowed by the platform (see
@@ -541,20 +817,24 @@ object LogiAuth {
                     val uri = pendingAuthorizeUri
                     if (uri != null && claimFallback()) {
                         runCatching { launchCustomTab(activity, uri) }.onFailure {
-                            deferred.complete(Result.failure(LogiAuthError.Network(it)))
+                            // Clear persisted state BEFORE completing: the
+                            // resumed caller can start a new flow the instant
+                            // the deferred resolves, and a clear() landing after
+                            // that would wipe the NEW transaction's state.
+                            // (codex review P2, 2026-08-10.)
                             pendingStore()?.clear()
-                            pendingSignIn = null
                             pendingAuthorizeUri = null
+                            failPendingFlow(LogiAuthError.Network(it))
                         }
                     }
                     return
                 }
                 val elapsed = System.currentTimeMillis() - pendingSignInLaunchedAt
                 if (elapsed < 500L) return  // pre-Custom-Tabs resume; ignore
-                deferred.complete(Result.failure(LogiAuthError.UserCancelled))
+                // Persisted cleanup first — same ordering reason as above.
                 pendingStore()?.clear()
-                pendingSignIn = null
                 pendingAuthorizeUri = null
+                failPendingFlow(LogiAuthError.UserCancelled)
             }
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
             override fun onActivityStarted(activity: Activity) {
@@ -569,7 +849,7 @@ object LogiAuth {
                 // unrelated backgrounding doesn't arm the cancel detector.
                 if (startedActivities == 0 &&
                     !activity.isChangingConfigurations &&
-                    pendingSignIn != null
+                    anyFlowPending()
                 ) {
                     sawBackgroundSinceLaunch = true
                 }
