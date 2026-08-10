@@ -41,9 +41,11 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
 
-    // Local JVM unit tests only (golden id_token vectors). The verifier is pure
-    // java.security + kotlinx-serialization, so no Android/Robolectric needed.
+    // Local JVM unit tests only (golden id_token vectors, and the handoff
+    // deadline driven on virtual time). Both are pure java.security /
+    // kotlinx-coroutines, so no Android/Robolectric needed.
     testImplementation("junit:junit:4.13.2")
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 // JitPack publishing — consumers add via:
@@ -57,7 +59,11 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.dcode-co.logi-auth-android"
                 artifactId = "logi-auth-android"
-                version = "1.0.4"
+                // 1.1.0: the callback wait grew a deadline
+                // (LogiAuthError.HandoffTimeout). Binary compatible; minor
+                // because a `when` over LogiAuthError with no `else` needs one
+                // more branch to recompile.
+                version = "1.1.0"
                 pom {
                     name.set("logi-auth-android")
                     licenses {

@@ -117,7 +117,29 @@ class LoginActivity : ComponentActivity() {
 | `LogiAuth.currentRefreshToken()` | `String?` | sync; cold-start 분기용 |
 | `LogiAuth.currentAccessToken()` | `String?` | sync; 만료됐을 가능성 있음 |
 
-에러 타입 (`LogiAuthError`): `NotConfigured`, `InvalidAuthorizeUrl`, `StateMismatch`, `UserCancelled`, `NoRefreshToken`, `TokenEndpoint`, `Network`.
+에러 타입 (`LogiAuthError`): `NotConfigured`, `InvalidAuthorizeUrl`, `StateMismatch`, `UserCancelled`, `HandoffTimeout`, `NoRefreshToken`, `TokenEndpoint`, `Network`.
+
+---
+
+## 대기 상한 — 5분 (v1.1.0+)
+
+`signIn()` / `authorize()` 는 무한히 기다리지 않는다. 콜백이 **300초** 안에 도착하지
+않으면 `LogiAuthError.HandoffTimeout` 으로 실패하고, 단일 비행 슬롯을 반납한다.
+그래서 마감 직후의 재시도는 `AlreadyInProgress` 가 아니라 정상 수락된다. iOS
+`logi-auth-swift` 와 같은 값이며, 설정으로 노출하지 않는다.
+
+**더 일찍 끊으려면 코루틴을 취소한다.** 별도 API 가 필요 없다 — `signIn()` 은
+`suspend` 함수이고 취소 시 내부 정리가 그대로 돈다.
+
+```kotlin
+val result = withTimeoutOrNull(60_000) { LogiAuth.signIn(activity) }
+    ?: return  // 1분 안에 안 돌아오면 포기. 슬롯은 이미 반납됨
+```
+
+**알려진 한계 — 분할화면**: 분할화면·프리폼에서는 logi 앱이 옆 창에 떠도 RP 액티비티가
+stop/resume 되지 않는다(API 29+ multi-resume). SDK 의 취소 감지가 lifecycle 콜백에
+의존하므로 이 경우 **마감이 유일한 종결자**다. 사용자가 승인 없이 이탈하면 최대 5분간
+대기가 유지된다. 이 UX 가 문제라면 위 `withTimeout` 으로 앱 정책에 맞는 상한을 직접 건다.
 
 ---
 

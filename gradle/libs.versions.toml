@@ -46,6 +46,7 @@ okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhtt
 okhttp-logging = { group = "com.squareup.okhttp3", name = "logging-interceptor", version.ref = "okhttp" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 play-integrity = { group = "com.google.android.play", name = "integrity", version.ref = "playIntegrity" }
 sentry-android = { group = "io.sentry", name = "sentry-android", version.ref = "sentry" }
 sentry-compose = { group = "io.sentry", name = "sentry-compose-android", version.ref = "sentry" }
