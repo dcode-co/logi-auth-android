@@ -28,7 +28,7 @@ dependencyResolutionManagement {
 `app/build.gradle.kts` 에 의존성 추가:
 ```kotlin
 dependencies {
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-sdk:v1.1.0")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.1.0")
     // 선택 — 토큰 저장 유틸이 필요할 때만:
     implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.1.0")
 }
