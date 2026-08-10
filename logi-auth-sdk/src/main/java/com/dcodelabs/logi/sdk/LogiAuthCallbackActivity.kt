@@ -36,9 +36,18 @@ class LogiAuthCallbackActivity : Activity() {
         super.onCreate(savedInstanceState)
         val data = intent?.data
         if (data != null) {
+            // Claim the callback synchronously, BEFORE finish() lets the RP
+            // Activity resume. The handler below runs on Dispatchers.IO, so it
+            // may not have started by the time the resume fires — and the
+            // cancel detector reads this flag to tell "user dismissed the tab"
+            // from "the callback is landing right now". Setting it inside the
+            // coroutine left a window where a perfectly good callback was
+            // completed as UserCancelled and then dropped.
+            // (codex review P1, 2026-08-10.)
+            LogiAuth.callbackInFlight = true
             // Fire-and-forget: hand off to LogiAuth on a background scope.
             // The pending CompletableDeferred inside LogiAuth completes
-            // whichever launching Activity is awaiting signIn().
+            // whichever launching Activity is awaiting signIn() / authorize().
             CoroutineScope(Dispatchers.IO).launch {
                 LogiAuth.handleAuthorizationCallback(data)
             }
