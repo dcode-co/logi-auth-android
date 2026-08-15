@@ -28,16 +28,16 @@ dependencyResolutionManagement {
 `app/build.gradle.kts` 에 의존성 추가:
 ```kotlin
 dependencies {
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.2.0")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.2.1")
     // 선택 — 토큰 저장 유틸이 필요할 때만:
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.2.0")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.2.1")
 }
 ```
 
 ### Option B — Maven Central (P2, 준비 중)
 
 ```kotlin
-implementation("com.dcodelabs.logi:logi-auth-android:1.2.0")
+implementation("com.dcodelabs.logi:logi-auth-android:1.2.1")
 ```
 > 🚧 _2026 Q3 publish 예정. 그 전까지는 JitPack 사용._
 
@@ -132,16 +132,34 @@ class LoginActivity : ComponentActivity() {
 
 ## API
 
+`:logi-auth-sdk` — 인증만 담당한다.
+
 | Method | Returns | Notes |
 |---|---|---|
 | `LogiAuth.configure(context, config)` | `Unit` | Application.onCreate 에서 1회 |
-| `LogiAuth.signIn(activity, scopes?)` | `Result<LogiAuthResult>` | suspend; Custom Tabs |
-| `LogiAuth.refresh()` | `Result<LogiAuthResult>` | suspend; 저장된 refresh token 사용 |
-| `LogiAuth.signOut()` | `Unit` | token store wipe |
-| `LogiAuth.currentRefreshToken()` | `String?` | sync; cold-start 분기용 |
-| `LogiAuth.currentAccessToken()` | `String?` | sync; 만료됐을 가능성 있음 |
+| `LogiAuth.signIn(activity, scopes?)` | `Result<LogiSession>` | suspend; app-to-app → Custom Tabs |
+| `LogiAuth.authorize(activity, startUri)` | `Result<LogiCallback>` | suspend; BFF(백엔드 주도) 흐름 |
+| `LogiAuth.isLogiAppInstalled(context)` | `Boolean` | sync; 버튼 문구 분기용 |
 
-에러 타입 (`LogiAuthError`): `NotConfigured`, `InvalidAuthorizeUrl`, `StateMismatch`, `UserCancelled`, `HandoffTimeout`, `NoRefreshToken`, `TokenEndpoint`, `Network`.
+`:logi-auth-storage` — 토큰 저장은 RP 의 결정이라 별도 모듈이다. 저장을 원할 때만 붙인다.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `LogiAuthStorage(context, config)` | — | 생성자. config 는 위와 같은 값 |
+| `storage.persist(session)` | `Unit` | 🔴 `signIn()` 성공 후 **직접** 호출. 코어는 저장하지 않는다 |
+| `storage.refresh()` | `Result<LogiAuthResult>` | suspend; 저장된 refresh token 사용 |
+| `storage.signOut()` | `Unit` | token store wipe |
+| `storage.currentRefreshToken()` | `String?` | sync; cold-start 분기용 |
+| `storage.currentAccessToken()` | `String?` | sync; 만료됐을 가능성 있음 |
+
+> v0.x 에서 올라온다면: `refresh`/`signOut`/`current*Token` 이 `LogiAuth` 정적 메서드에서
+> 이 인스턴스 메서드로 옮겨졌고, `signIn` 후 저장이 자동에서 수동(`persist`)으로 바뀌었다.
+> `persist` 를 빠뜨리면 **앱 재시작마다 로그인이 풀린다.** 저장 좌표
+> (`logi_auth_sdk_<clientId>`)는 그대로라 기존 사용자 세션은 유지된다.
+
+에러 타입 (`LogiAuthError`): `NotConfigured`, `InvalidAuthorizeUrl`, `MissingStateInStartUri`,
+`StateMismatch`, `UserCancelled`, `HandoffTimeout`, `AlreadyInProgress`, `NoRefreshToken`,
+`MissingIdToken`, `IdTokenInvalid`, `JwksFetchFailed`, `TokenEndpoint`, `Network`.
 
 ---
 
@@ -170,7 +188,7 @@ stop/resume 되지 않는다(API 29+ multi-resume). SDK 의 취소 감지가 lif
 ## How it works
 
 1. **App-to-app first**: `Intent(ACTION_VIEW, authorizeUrl).setPackage("com.dcodelabs.logi")` 로 logi 앱이 설치된 경우 즉시 핸드오프.
-2. **Custom Tabs fallback**: 미설치 시 `CustomTabsIntent` 로 시스템 브라우저.
+2. **Custom Tabs fallback**: 미설치(또는 핸드오프 실패) 시 `CustomTabsIntent` 로 브라우저. 인텐트를 **브라우저 패키지에 고정**해 App Links claim 이 폴백을 가로채지 못하게 한다.
 3. **EncryptedSharedPreferences**: refresh token 저장 (AES-256-GCM, AndroidKeyStore-backed).
 4. **PKCE S256**: code_verifier 메모리, code_challenge 만 전송.
 5. **Zero project deps**: `:core:*`, `:feature:*` 모듈 의존성 없음. Hilt/Compose/Retrofit 사용 여부 무관하게 drop-in.
@@ -198,7 +216,7 @@ SDK 가 `consumer-rules.pro` 를 동봉하므로 추가 설정 불필요.
 
 ## Versioning
 
-- `v1.1.x` — current stable. minSdk 23, target SDK 35, Kotlin 2.1+, JDK 17.
+- `v1.2.x` — current stable. minSdk 23, target SDK 35, Kotlin 2.1+, JDK 17.
 - Semantic versioning. Tag `vX.Y.Z`.
 
 ---

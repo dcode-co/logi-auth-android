@@ -71,7 +71,11 @@ afterEvaluate {
                 // module publishes `api(project(":logi-auth-sdk"))` as a POM
                 // dependency pinned to whatever is written here, so leaving it
                 // behind makes storage consumers silently pull the old core.
-                version = "1.2.0"
+                // 1.2.1: the Custom Tab fallback is pinned to a browser package.
+                // Cut as a new version rather than re-tagging 1.2.0 because
+                // JitPack caches an artifact per tag — moving the tag leaves
+                // consumers on the already-built one.
+                version = "1.2.1"
                 pom {
                     name.set("logi-auth-android")
                     licenses {
