@@ -75,7 +75,12 @@ afterEvaluate {
                 // Cut as a new version rather than re-tagging 1.2.0 because
                 // JitPack caches an artifact per tag — moving the tag leaves
                 // consumers on the already-built one.
-                version = "1.2.1"
+                // 1.3.0: BFF surface grows the host split — authorize() takes an optional
+                // nativeStartUri (validated to be the same transaction) and
+                // handleAuthorizationCallback() reports whether it consumed the
+                // callback, so RPs with their own transaction stash can fall back
+                // deterministically after process death.
+                version = "1.3.0"
                 pom {
                     name.set("logi-auth-android")
                     licenses {

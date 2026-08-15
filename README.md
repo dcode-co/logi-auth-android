@@ -28,16 +28,16 @@ dependencyResolutionManagement {
 `app/build.gradle.kts` 에 의존성 추가:
 ```kotlin
 dependencies {
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.2.1")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.3.0")
     // 선택 — 토큰 저장 유틸이 필요할 때만:
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.2.1")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.3.0")
 }
 ```
 
 ### Option B — Maven Central (P2, 준비 중)
 
 ```kotlin
-implementation("com.dcodelabs.logi:logi-auth-android:1.2.1")
+implementation("com.dcodelabs.logi:logi-auth-android:1.3.0")
 ```
 > 🚧 _2026 Q3 publish 예정. 그 전까지는 JitPack 사용._
 
@@ -216,7 +216,7 @@ SDK 가 `consumer-rules.pro` 를 동봉하므로 추가 설정 불필요.
 
 ## Versioning
 
-- `v1.2.x` — current stable. minSdk 23, target SDK 35, Kotlin 2.1+, JDK 17.
+- `v1.3.x` — current stable. minSdk 23, target SDK 35, Kotlin 2.1+, JDK 17.
 - Semantic versioning. Tag `vX.Y.Z`.
 
 ---

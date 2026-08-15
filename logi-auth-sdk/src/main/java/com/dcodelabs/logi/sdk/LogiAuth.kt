@@ -17,6 +17,7 @@ import com.dcodelabs.logi.sdk.internal.IdTokenVerifyError
 import com.dcodelabs.logi.sdk.internal.Jwks
 import com.dcodelabs.logi.sdk.internal.JwksClient
 import com.dcodelabs.logi.sdk.internal.PendingAuthStore
+import com.dcodelabs.logi.sdk.internal.StartUriState
 import com.dcodelabs.logi.sdk.internal.Pkce
 import com.dcodelabs.logi.sdk.internal.TokenExchange
 import com.dcodelabs.logi.sdk.internal.VerifiedIdToken
@@ -392,6 +393,23 @@ object LogiAuth {
      * app-to-app handoff first, Custom Tabs fallback, and the same cancel
      * detector. Pass an Activity context — Custom Tabs requires it.
      *
+     * ## The authorize host split, BFF edition
+     *
+     * [nativeStartUri] is the same authorization request addressed to the host
+     * that claims `/oauth/authorize*` as an App Link (stock: `open.1pass.dev`),
+     * so the app-to-app first-try can launch the logi app. [startUri] stays the
+     * browser leg. The SDK deliberately does **not** derive one from the other —
+     * a BFF start Uri is the RP backend's policy object (staging, proxies,
+     * signed URLs), and rewriting it here would break non-stock deployments.
+     * Build the native leg by swapping only the host on the web leg's Uri, so
+     * the query cannot drift; the SDK rejects a pair whose `state` differs
+     * ([LogiAuthError.StartUriStateMismatch]) **before** opening anything.
+     *
+     * Omitted [nativeStartUri] keeps the pre-split behaviour: both legs open
+     * [startUri]. That is only correct while the claim still sits on the issuer
+     * host — once it moves off, a first-try at the issuer host stops launching
+     * the app.
+     *
      * **Does not survive process death.** The suspended call lives in memory, so
      * if Android kills the app while the authorization surface is open, this
      * call dies with it and the returning callback finds nothing to resolve.
@@ -399,12 +417,17 @@ object LogiAuth {
      * abandoning one costs nothing but its TTL. [signIn] has the same limit —
      * treat a login that never returns as a login to retry, not as one to
      * resume. Do not persist the code or state to work around this; that would
-     * put a live authorization code in app storage.
+     * put a live authorization code in app storage. (RPs that keep their own
+     * process-death-safe transaction stash can route the late callback through
+     * their fallback path — [handleAuthorizationCallback] returns whether the
+     * SDK consumed it, precisely so that fallback can be deterministic.)
      */
     @JvmStatic
+    @JvmOverloads
     suspend fun authorize(
         activity: Context,
         startUri: Uri,
+        nativeStartUri: Uri? = null,
     ): Result<LogiCallback> {
         // `state` comes from the backend, embedded in the Uri it built. Read it
         // back so the callback can be matched to this flow — the SDK is not
@@ -413,9 +436,22 @@ object LogiAuth {
         //
         // Checked before the config lookup and before the pending slot is armed
         // so a rejected argument never holds the single-flight lock — that would
-        // block every later flow with AlreadyInProgress.
-        val state = runCatching { startUri.getQueryParameter("state") }.getOrNull()
-        if (state.isNullOrEmpty()) return Result.failure(LogiAuthError.MissingStateInStartUri)
+        // block every later flow with AlreadyInProgress. Nothing has been
+        // launched at this point, so a rejection cannot strand a half-open flow.
+        val state = when (val v = StartUriState.read(startUri.toString())) {
+            is StartUriState.One -> v.value
+            else -> return Result.failure(LogiAuthError.MissingStateInStartUri)
+        }
+        if (nativeStartUri != null) {
+            // The two legs must be one transaction. A duplicated `state` on the
+            // native leg is treated as a mismatch, not as "pick one": ambiguity
+            // about which state the server will echo is exactly the drift this
+            // check exists to reject.
+            val nativeState = StartUriState.read(nativeStartUri.toString())
+            if (nativeState !is StartUriState.One || nativeState.value != state) {
+                return Result.failure(LogiAuthError.StartUriStateMismatch)
+            }
+        }
 
         val store = pendingStore() ?: return Result.failure(LogiAuthError.NotConfigured)
 
@@ -441,12 +477,15 @@ object LogiAuth {
             deferred,
             clearPersisted = { store.pendingState = null },
         ) {
-            // BFF flow: the host is the RP backend's decision (it issued
-            // `startUri`), so the SDK does not apply the authorize host split
-            // here — overriding a non-stock backend's host would break it.
-            // Both legs use `startUri` as given. Same call as the iOS SDK's
-            // `authorize(startURL:)`.
-            launchAuthorizationSurface(activity, NativeLeg(startUri), WebLeg(startUri))
+            // BFF flow: the host is the RP's (or its backend's) decision — the
+            // SDK never derives one leg from the other here. `nativeStartUri`
+            // omitted keeps the pre-split single-Uri behaviour. Same contract as
+            // the iOS SDK's `authorize(startURL:nativeStartURL:)`.
+            launchAuthorizationSurface(
+                activity,
+                NativeLeg(nativeStartUri ?: startUri),
+                WebLeg(startUri),
+            )
         }
     }
 
@@ -753,6 +792,22 @@ object LogiAuth {
      * forward the redirect Uri here rather than using the SDK's built-in
      * Activity.
      *
+     * Returns whether the SDK **consumed** the callback: `true` when a pending
+     * [signIn]/[authorize] flow existed and was resolved with it (including
+     * resolving to a failure such as [LogiAuthError.StateMismatch]), `false`
+     * when nothing was awaiting — configure not called, or the launching flow
+     * died with the process. RPs that keep their own process-death-safe
+     * transaction stash should route an unconsumed callback through their own
+     * fallback path:
+     *
+     * ```kotlin
+     * if (!LogiAuth.handleAuthorizationCallback(uri)) legacyDispatch(uri)
+     * ```
+     *
+     * The split is deterministic on purpose — guessing from a side-channel flag
+     * whether the SDK "probably" took it would double-process the callback in
+     * one interleaving and drop it in another.
+     *
      * **If you write your own callback Activity, set [callbackInFlight] to true
      * synchronously in `onCreate` before launching this suspend function.**
      * This function sets it at entry, but a coroutine dispatch can land after
@@ -762,7 +817,7 @@ object LogiAuth {
      * does exactly this; mirror it. (codex review, 2026-08-10.)
      */
     @JvmStatic
-    suspend fun handleAuthorizationCallback(callbackUri: Uri) {
+    suspend fun handleAuthorizationCallback(callbackUri: Uri): Boolean {
         // [LogiAuthCallbackActivity] sets this before finish() so the cancel
         // detector cannot mistake a landing callback for a dismissal. Every exit
         // from here must clear it, including the early returns below — a stuck
@@ -773,16 +828,16 @@ object LogiAuth {
         // cancel detector can classify a landing callback as a dismissal.
         // (codex review P2, 2026-08-10.)
         callbackInFlight = true
-        try {
+        return try {
             handleAuthorizationCallbackInner(callbackUri)
         } finally {
             callbackInFlight = false
         }
     }
 
-    private suspend fun handleAuthorizationCallbackInner(callbackUri: Uri) {
-        val cfg = config ?: return
-        val store = pendingStore() ?: return
+    private suspend fun handleAuthorizationCallbackInner(callbackUri: Uri): Boolean {
+        val cfg = config ?: return false
+        val store = pendingStore() ?: return false
 
         // Backend-led flow: hand the pair straight back. No token exchange and
         // no id_token verification here — the RP backend owns both, and doing
@@ -830,10 +885,10 @@ object LogiAuth {
             // a flow that already gave up. See the sign-in branch below.
             releaseFlowIfOwner(authorizeDeferred) { store.pendingState = null }
             authorizeDeferred.complete(outcome)
-            return
+            return true
         }
 
-        val deferred = pendingSignIn ?: return  // not awaiting any sign-in
+        val deferred = pendingSignIn ?: return false  // not awaiting any sign-in
 
         callbackInFlight = true  // suppress the cancel-detector race
         // Same shape as the authorize branch: compute the outcome, tear down,
@@ -915,6 +970,7 @@ object LogiAuth {
             store.pendingNonce = null
         }
         deferred.complete(outcome)
+        return true
     }
 
     /**

@@ -75,6 +75,19 @@ sealed class LogiAuthError(message: String, cause: Throwable? = null) : RuntimeE
     object MissingStateInStartUri : LogiAuthError(
         "The authorize Uri has no state parameter — the RP backend must include one."
     )
+
+    /**
+     * [LogiAuth.authorize] was handed a native/web start Uri pair whose `state`
+     * parameters differ (or one carries a duplicated `state`). The two Uris must
+     * be the *same* authorization request on different hosts; with different
+     * states the fallback would be a different transaction than the one this
+     * flow's callback is matched against, and whichever leg "wins" would fail
+     * the callback state check. Launch-time input validation — nothing has been
+     * opened when this is returned.
+     */
+    object StartUriStateMismatch : LogiAuthError(
+        "startUri and nativeStartUri carry different state parameters — the two legs must be one authorization request."
+    )
     object StateMismatch : LogiAuthError(
         "OAuth state parameter did not match — possible CSRF / hijack."
     )

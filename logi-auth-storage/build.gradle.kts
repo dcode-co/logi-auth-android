@@ -47,7 +47,7 @@ afterEvaluate {
                 // ":logi-auth-sdk"))` above becomes a POM dependency stamped with
                 // that version, so a lagging bump here ships storage against the
                 // old core.
-                version = "1.2.1"
+                version = "1.3.0"
                 pom {
                     name.set("logi-auth-storage")
                     licenses {
