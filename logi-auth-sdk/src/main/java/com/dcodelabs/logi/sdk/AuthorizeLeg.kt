@@ -19,12 +19,14 @@ internal value class NativeLeg(val uri: Uri)
  * returns the callback to the wrong browser (the iOS SDK shipped that bug as
  * the axhub `state mismatch` incident).
  *
- * ⚠️ As of 2026-08-15 `api.1pass.dev/.well-known/assetlinks.json` still grants
- * `handle_all_urls` to `com.dcodelabs.logi`, so this leg **is** interceptable
- * today — moving the handoff off it is the first half of the fix, and the claim
- * comes off once every RP has shipped a host-splitting SDK. Until then a
- * fallback that fires while the logi app is installed can still be captured.
- * Keeping the split correct now is what makes that removal safe later.
+ * ⚠️ As of 2026-08-15 `api.1pass.dev` is still *verified* for
+ * `com.dcodelabs.logi` (checked on-device with `pm get-app-links`), so this
+ * host is not actually unclaimed yet — the claim comes off only once every RP
+ * has shipped a host-splitting SDK, because removing it earlier would kill the
+ * app handoff for RPs still on an older one. Two things keep this leg safe in
+ * the meantime: the handoff no longer *needs* this host, and
+ * [LogiAuth.launchCustomTab] pins the Custom Tab to a browser package so a
+ * verified claimant cannot win the intent.
  *
  * Why two wrapper types instead of two `Uri` parameters: the surface that
  * consumes them ([LogiAuth.launchAuthorizationSurface] and the deferred

@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import androidx.browser.customtabs.CustomTabsClient
 import androidx.browser.customtabs.CustomTabsIntent
 import com.dcodelabs.logi.sdk.internal.AuthorizeHostSplit
 import com.dcodelabs.logi.sdk.internal.IdTokenVerificationException
@@ -653,11 +654,49 @@ object LogiAuth {
     }
 
     /** Open the authorize URL in a Custom Tab. Throws if no browser handles it. */
+    /**
+     * Open the browser leg in a Custom Tab, **pinned to a browser package**.
+     *
+     * 🔴 The pin is the load-bearing part, not a nicety. `launchUrl()` fires a
+     * plain `ACTION_VIEW`, and an app that has *verified* App Links for the
+     * host wins that intent over any browser. `api.1pass.dev` is currently
+     * verified for `com.dcodelabs.logi` (confirmed on-device via
+     * `pm get-app-links`), so an unpinned fallback lands right back in the logi
+     * app — the exact interception the host split exists to stop, reintroduced
+     * on the one leg that has no other way out. Moving the handoff to
+     * `open.1pass.dev` does not help here: this leg keeps using the issuer host
+     * by design.
+     *
+     * Resolution order: the browser that advertises Custom Tabs support, then
+     * whatever handles a bare `http:` intent, then unpinned. The last step only
+     * happens when the device has no browser at all, where an unpinned launch
+     * is no worse than failing outright.
+     */
     private fun launchCustomTab(context: Context, authorizeUri: Uri) {
-        CustomTabsIntent.Builder()
+        val tabsIntent = CustomTabsIntent.Builder()
             .setShowTitle(true)
             .build()
-            .launchUrl(context, authorizeUri)
+        browserPackage(context)?.let { tabsIntent.intent.setPackage(it) }
+        tabsIntent.launchUrl(context, authorizeUri)
+    }
+
+    /**
+     * A package that will render a web page — never the logi app.
+     *
+     * `CustomTabsClient.getPackageName(context, null)` already excludes non
+     * browsers, and the `http:` probe below resolves against the browser
+     * category only, so neither can return an App Links claimant.
+     */
+    private fun browserPackage(context: Context): String? {
+        CustomTabsClient.getPackageName(context, null)?.let { return it }
+        val probe = Intent(Intent.ACTION_VIEW, Uri.parse("http://"))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+        @Suppress("DEPRECATION")
+        return context.packageManager
+            .resolveActivity(probe, PackageManager.MATCH_DEFAULT_ONLY)
+            ?.activityInfo
+            ?.packageName
+            ?.takeIf { it != LOGI_APP_PACKAGE && !it.contains("resolver", ignoreCase = true) }
     }
 
     private fun tryNativeHandoff(context: Context, authorizeUri: Uri): Boolean {

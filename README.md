@@ -73,10 +73,11 @@ class MyApplication : Application() {
 > 🔴 폴백을 claim 된 호스트로 보내면 안 된다. 그 갈래에 도달하는 사용자는 logi 앱
 > **미설치** 사용자뿐이고, 그들에게는 그 갈래가 로그인 전부다.
 >
-> ⚠️ **이행 중(2026-08-15)** — `api.1pass.dev` 의 assetlinks 는 아직
-> `com.dcodelabs.logi` 에 `handle_all_urls` 를 준다. 즉 폴백이 여전히 가로채일 수 있다.
-> claim 제거는 **모든 RP 가 호스트 분리 SDK 로 올라간 뒤**다(먼저 걷어내면 구버전 SDK 를
-> 쓰는 RP 의 앱 자동 점프가 즉시 끊긴다). 이 버전으로 올리는 것이 그 제거의 선행 조건이다.
+> ⚠️ **이행 중(2026-08-15)** — `api.1pass.dev` 는 아직 `com.dcodelabs.logi` 로
+> **verified** 상태다(기기에서 `pm get-app-links` 로 확인). claim 제거는 **모든 RP 가
+> 호스트 분리 SDK 로 올라간 뒤**다 — 먼저 걷어내면 구버전 SDK 를 쓰는 RP 의 앱 자동
+> 점프가 즉시 끊긴다. 그동안 폴백은 SDK 가 Custom Tab 을 **브라우저 패키지에 고정**해
+> 지킨다(고정하지 않으면 verified 앱이 ACTION_VIEW 를 브라우저보다 먼저 가져간다).
 >
 > stock 프로덕션 issuer(`https://api.1pass.dev`)면 SDK 가 자동으로 파생하므로 **설정할 것이
 > 없다**. 스테이징·자체호스팅은 파생하지 않고(다른 배포로 authorize 를 던지게 되므로) 두 갈래
