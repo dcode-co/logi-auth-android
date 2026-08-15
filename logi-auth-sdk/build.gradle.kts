@@ -80,7 +80,7 @@ afterEvaluate {
                 // handleAuthorizationCallback() reports whether it consumed the
                 // callback, so RPs with their own transaction stash can fall back
                 // deterministically after process death.
-                version = "1.3.0"
+                version = "1.3.1"
                 pom {
                     name.set("logi-auth-android")
                     licenses {

@@ -77,16 +77,17 @@ sealed class LogiAuthError(message: String, cause: Throwable? = null) : RuntimeE
     )
 
     /**
-     * [LogiAuth.authorize] was handed a native/web start Uri pair whose `state`
-     * parameters differ (or one carries a duplicated `state`). The two Uris must
-     * be the *same* authorization request on different hosts; with different
-     * states the fallback would be a different transaction than the one this
-     * flow's callback is matched against, and whichever leg "wins" would fail
-     * the callback state check. Launch-time input validation — nothing has been
-     * opened when this is returned.
+     * [LogiAuth.authorize] was handed a native/web start Uri pair that is not
+     * the same authorization request: the query or path differs beyond the
+     * host, or a Uri carries a duplicated `state`. A drifting `state` makes the
+     * fallback a different transaction than the one the callback is matched
+     * against, a drifting `redirect_uri` strands the handoff until timeout, and
+     * drifting PKCE fails the backend exchange after the user already
+     * authenticated. Launch-time input validation — nothing has been opened
+     * when this is returned.
      */
-    object StartUriStateMismatch : LogiAuthError(
-        "startUri and nativeStartUri carry different state parameters — the two legs must be one authorization request."
+    object StartUriPairMismatch : LogiAuthError(
+        "startUri and nativeStartUri are not the same authorization request — only the host may differ."
     )
     object StateMismatch : LogiAuthError(
         "OAuth state parameter did not match — possible CSRF / hijack."

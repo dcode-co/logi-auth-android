@@ -1,5 +1,6 @@
 package com.dcodelabs.logi.sdk
 
+import com.dcodelabs.logi.sdk.internal.StartUriPairVerdict
 import com.dcodelabs.logi.sdk.internal.StartUriState
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -8,11 +9,12 @@ import org.junit.Test
  * Pins the launch-time input validation of `authorize(startUri, nativeStartUri)`.
  *
  * The verdicts drive which error the caller gets **before anything is
- * launched**: `Missing` → `MissingStateInStartUri`, `Duplicated` or a value
- * differing from the web leg → `StartUriStateMismatch`. `authorize()` itself
- * needs an Activity and `android.net.Uri`, so what JVM tests can pin is this
- * decision function — the wiring (validate before the single-flight claim,
- * launch only after both pass) is asserted by the call order in `authorize()`.
+ * launched**: no usable `state` → `MissingStateInStartUri`; a duplicated
+ * `state`, or a pair that differs beyond the host → `StartUriPairMismatch`.
+ * `authorize()` itself needs an Activity and `android.net.Uri`, so what JVM
+ * tests can pin are these decision functions — the wiring (validate before the
+ * single-flight claim, launch only after both pass) is asserted by the call
+ * order in `authorize()`.
  */
 class StartUriStateTest {
 
@@ -63,17 +65,79 @@ class StartUriStateTest {
         assertEquals(StartUriState.Missing, StartUriState.read("$base"))
     }
 
+    // ---- StartUriPairVerdict ----
+
     /**
      * The meetnote-shaped pair: the native leg derived from the web leg by a
-     * host swap keeps the identical state → the pair passes validation.
+     * host swap → passes, and the shared state comes back.
      */
     @Test
-    fun `host-swapped pair carries the same state`() {
+    fun `host-swapped pair validates`() {
         val web = "$base?state=S1&code_challenge=C&code_challenge_method=S256"
         val native = web.replace("api.1pass.dev", "open.1pass.dev")
-        val webState = StartUriState.read(web)
-        val nativeState = StartUriState.read(native)
-        assertEquals(webState, nativeState)
-        assertEquals(StartUriState.One("S1"), webState)
+        assertEquals(StartUriPairVerdict.Ok("S1"), StartUriPairVerdict.validate(web, native))
+    }
+
+    @Test
+    fun `null native leg validates as single uri`() {
+        assertEquals(
+            StartUriPairVerdict.Ok("S1"),
+            StartUriPairVerdict.validate("$base?state=S1&code_challenge=C", null),
+        )
+    }
+
+    @Test
+    fun `missing state on web leg is MissingState`() {
+        assertEquals(
+            StartUriPairVerdict.MissingState,
+            StartUriPairVerdict.validate("$base?client_id=x", null),
+        )
+    }
+
+    /**
+     * Duplicated `state` is a pair-contract violation, not a missing state —
+     * the caller must learn it built a bad Uri, not that it forgot the state.
+     */
+    @Test
+    fun `duplicated state is PairMismatch`() {
+        assertEquals(
+            StartUriPairVerdict.PairMismatch,
+            StartUriPairVerdict.validate("$base?state=a&state=b", null),
+        )
+    }
+
+    /**
+     * 🔴 Same state is NOT enough. A drifting `redirect_uri` strands the
+     * handoff until timeout; drifting PKCE fails the exchange after the user
+     * already authenticated. The whole query must be byte-identical.
+     */
+    @Test
+    fun `same state but drifting query is PairMismatch`() {
+        val web = "$base?state=S1&redirect_uri=a%3A%2F%2Fcb&code_challenge=C1"
+        val drifted = "https://open.1pass.dev/oauth/authorize?state=S1&redirect_uri=b%3A%2F%2Fcb&code_challenge=C1"
+        assertEquals(StartUriPairVerdict.PairMismatch, StartUriPairVerdict.validate(web, drifted))
+    }
+
+    @Test
+    fun `different path is PairMismatch`() {
+        assertEquals(
+            StartUriPairVerdict.PairMismatch,
+            StartUriPairVerdict.validate(
+                "$base?state=S1",
+                "https://open.1pass.dev/oauth/authorize2?state=S1",
+            ),
+        )
+    }
+
+    /** Only the host may differ — that is the entire point of the pair. */
+    @Test
+    fun `different port is PairMismatch`() {
+        assertEquals(
+            StartUriPairVerdict.PairMismatch,
+            StartUriPairVerdict.validate(
+                "$base?state=S1",
+                "https://open.1pass.dev:8443/oauth/authorize?state=S1",
+            ),
+        )
     }
 }

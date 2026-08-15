@@ -17,7 +17,7 @@ import com.dcodelabs.logi.sdk.internal.IdTokenVerifyError
 import com.dcodelabs.logi.sdk.internal.Jwks
 import com.dcodelabs.logi.sdk.internal.JwksClient
 import com.dcodelabs.logi.sdk.internal.PendingAuthStore
-import com.dcodelabs.logi.sdk.internal.StartUriState
+import com.dcodelabs.logi.sdk.internal.StartUriPairVerdict
 import com.dcodelabs.logi.sdk.internal.Pkce
 import com.dcodelabs.logi.sdk.internal.TokenExchange
 import com.dcodelabs.logi.sdk.internal.VerifiedIdToken
@@ -402,8 +402,9 @@ object LogiAuth {
      * a BFF start Uri is the RP backend's policy object (staging, proxies,
      * signed URLs), and rewriting it here would break non-stock deployments.
      * Build the native leg by swapping only the host on the web leg's Uri, so
-     * the query cannot drift; the SDK rejects a pair whose `state` differs
-     * ([LogiAuthError.StartUriStateMismatch]) **before** opening anything.
+     * the query cannot drift; the SDK rejects a pair that is not the same
+     * request modulo host ([LogiAuthError.StartUriPairMismatch]) **before**
+     * opening anything.
      *
      * Omitted [nativeStartUri] keeps the pre-split behaviour: both legs open
      * [startUri]. That is only correct while the claim still sits on the issuer
@@ -438,19 +439,14 @@ object LogiAuth {
         // so a rejected argument never holds the single-flight lock — that would
         // block every later flow with AlreadyInProgress. Nothing has been
         // launched at this point, so a rejection cannot strand a half-open flow.
-        val state = when (val v = StartUriState.read(startUri.toString())) {
-            is StartUriState.One -> v.value
-            else -> return Result.failure(LogiAuthError.MissingStateInStartUri)
-        }
-        if (nativeStartUri != null) {
-            // The two legs must be one transaction. A duplicated `state` on the
-            // native leg is treated as a mismatch, not as "pick one": ambiguity
-            // about which state the server will echo is exactly the drift this
-            // check exists to reject.
-            val nativeState = StartUriState.read(nativeStartUri.toString())
-            if (nativeState !is StartUriState.One || nativeState.value != state) {
-                return Result.failure(LogiAuthError.StartUriStateMismatch)
-            }
+        val state = when (
+            val v = StartUriPairVerdict.validate(startUri.toString(), nativeStartUri?.toString())
+        ) {
+            is StartUriPairVerdict.Ok -> v.state
+            StartUriPairVerdict.MissingState ->
+                return Result.failure(LogiAuthError.MissingStateInStartUri)
+            StartUriPairVerdict.PairMismatch ->
+                return Result.failure(LogiAuthError.StartUriPairMismatch)
         }
 
         val store = pendingStore() ?: return Result.failure(LogiAuthError.NotConfigured)
