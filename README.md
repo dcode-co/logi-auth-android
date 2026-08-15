@@ -28,16 +28,16 @@ dependencyResolutionManagement {
 `app/build.gradle.kts` 에 의존성 추가:
 ```kotlin
 dependencies {
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.1.0")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-android:v1.2.0")
     // 선택 — 토큰 저장 유틸이 필요할 때만:
-    implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.1.0")
+    implementation("com.github.dcode-co.logi-auth-android:logi-auth-storage:v1.2.0")
 }
 ```
 
 ### Option B — Maven Central (P2, 준비 중)
 
 ```kotlin
-implementation("com.dcodelabs.logi:logi-auth-android:1.1.0")
+implementation("com.dcodelabs.logi:logi-auth-android:1.2.0")
 ```
 > 🚧 _2026 Q3 publish 예정. 그 전까지는 JitPack 사용._
 
@@ -61,6 +61,22 @@ class MyApplication : Application() {
     }
 }
 ```
+
+> **authorize 핸드오프 호스트 (v1.2.0~)** — `signIn()` 의 두 갈래는 같은 인가 요청을
+> 서로 다른 호스트로 보낸다. 쿼리(`state`·`nonce`·`code_challenge`)는 동일하고 host 만 다르다.
+>
+> | 갈래 | 호스트 | 이유 |
+> |---|---|---|
+> | 네이티브 app-to-app | `open.1pass.dev` | assetlinks 가 `/oauth/authorize*` 를 claim → logi 앱이 열린다 |
+> | Custom Tabs 폴백 | `issuer` 호스트 = `api.1pass.dev` | claim 이 **없어야** 브라우저 로그인이 가로채이지 않는다 |
+>
+> 🔴 폴백을 claim 된 호스트로 보내면 안 된다. 그 갈래에 도달하는 사용자는 logi 앱
+> **미설치** 사용자뿐이고, 그들에게는 그 갈래가 로그인 전부다.
+>
+> stock 프로덕션 issuer(`https://api.1pass.dev`)면 SDK 가 자동으로 파생하므로 **설정할 것이
+> 없다**. 스테이징·자체호스팅은 파생하지 않고(다른 배포로 authorize 를 던지게 되므로) 두 갈래
+> 모두 그 issuer 호스트에 남으니, 자체 부처를 운영한다면 `nativeAuthorizeHost` 로 직접 지정한다.
+> `issuer` 는 그대로다 — 토큰 교환·JWKS·id_token `iss` 검증은 전부 `issuer` 바인딩을 유지한다.
 
 `AndroidManifest.xml`:
 ```xml

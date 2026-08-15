@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.browser.customtabs.CustomTabsIntent
+import com.dcodelabs.logi.sdk.internal.AuthorizeHostSplit
 import com.dcodelabs.logi.sdk.internal.IdTokenVerificationException
 import com.dcodelabs.logi.sdk.internal.IdTokenVerifyError
 import com.dcodelabs.logi.sdk.internal.Jwks
@@ -309,8 +310,17 @@ object LogiAuth {
     /** Started (visible-lifecycle) Activity count — zero means backgrounded. */
     private var startedActivities: Int = 0
 
-    /** Authorize URL of the in-flight sign-in, kept for the deferred fallback. */
-    @Volatile private var pendingAuthorizeUri: Uri? = null
+    /**
+     * Authorize URL of the in-flight sign-in, kept for the deferred fallback.
+     *
+     * Typed as [WebLeg], not `Uri`, on purpose: the deferred fallback re-opens
+     * this in a Custom Tab, so parking the native leg here would send a browser
+     * sign-in to the host that claims `/oauth/authorize*`. That mistake is a
+     * plain assignment the compiler would otherwise wave through, and no JVM
+     * unit test can reach this code path (it needs `android.net.Uri` and a live
+     * Activity lifecycle), so the type is the only guard available.
+     */
+    @Volatile private var pendingAuthorizeUri: WebLeg? = null
 
     /** Whether the current sign-in went out via the app-to-app path. */
     @Volatile private var nativeHandoffAttempted: Boolean = false
@@ -430,7 +440,12 @@ object LogiAuth {
             deferred,
             clearPersisted = { store.pendingState = null },
         ) {
-            launchAuthorizationSurface(activity, startUri)
+            // BFF flow: the host is the RP backend's decision (it issued
+            // `startUri`), so the SDK does not apply the authorize host split
+            // here — overriding a non-stock backend's host would break it.
+            // Both legs use `startUri` as given. Same call as the iOS SDK's
+            // `authorize(startURL:)`.
+            launchAuthorizationSurface(activity, NativeLeg(startUri), WebLeg(startUri))
         }
     }
 
@@ -476,7 +491,9 @@ object LogiAuth {
         }
         if (!claimed) return Result.failure(LogiAuthError.AlreadyInProgress)
 
-        val authorizeUri = Uri.parse(cfg.issuer.trimEnd('/') + "/oauth/authorize")
+        // The web leg, off the untouched issuer host — built first so the
+        // fallback Uri cannot pick up a host swap by accident.
+        val webAuthorizeUri = Uri.parse(cfg.issuer.trimEnd('/') + "/oauth/authorize")
             .buildUpon()
             .appendQueryParameter("response_type", "code")
             .appendQueryParameter("client_id", cfg.clientId)
@@ -487,6 +504,20 @@ object LogiAuth {
             .appendQueryParameter("code_challenge", challenge)
             .appendQueryParameter("code_challenge_method", "S256")
             .build()
+        // Same authorization request, addressed to the handoff host. Only the
+        // host differs — state/nonce/code_challenge come off the one Uri above,
+        // so the two legs cannot become different requests. Deriving the native
+        // leg *from* the web leg (rather than building it separately) is what
+        // makes that structural rather than a convention.
+        val nativeLeg = NativeLeg(
+            Uri.parse(
+                AuthorizeHostSplit.withHost(
+                    webAuthorizeUri.toString(),
+                    cfg.resolvedNativeAuthorizeHost,
+                ),
+            ),
+        )
+        val webLeg = WebLeg(webAuthorizeUri)
 
         pendingSignInLaunchedAt = System.currentTimeMillis()
         sawBackgroundSinceLaunch = false
@@ -520,7 +551,7 @@ object LogiAuth {
                 store.pendingNonce = null
             },
         ) {
-            launchAuthorizationSurface(activity, authorizeUri)
+            launchAuthorizationSurface(activity, nativeLeg, webLeg)
         }
     }
 
@@ -556,20 +587,30 @@ object LogiAuth {
      * (codex review P1, 2026-07-28.) Waiting on the *starting window* rather
      * than a loaded app keeps this from cutting a legitimately slow cold start
      * short; see [HANDOFF_FOREGROUND_TIMEOUT_MS].
+     *
+     * The two Uris are the same authorization request on different hosts:
+     * [nativeUri] goes to the handoff host that claims `/oauth/authorize*`,
+     * [webUri] stays on the issuer host. 🔴 [webUri] must never be the claimed
+     * host — the only users who reach the browser leg are those without the
+     * logi app, and for them that leg is the entire sign-in. See
+     * [LogiAuthConfig.resolvedNativeAuthorizeHost].
      */
     private suspend fun launchAuthorizationSurface(
         activity: Context,
-        authorizeUri: Uri,
+        native: NativeLeg,
+        web: WebLeg,
     ): LogiAuthError? {
-        pendingAuthorizeUri = authorizeUri
+        // Fallback-only — the cancel detector re-launches this in a Custom Tab,
+        // so it must hold the web leg, never the handoff host.
+        pendingAuthorizeUri = web
         fallbackLaunched = false
-        nativeHandoffAttempted = tryNativeHandoff(activity, authorizeUri)
+        nativeHandoffAttempted = tryNativeHandoff(activity, native.uri)
         val canDetectHandoffFailure = (activity as? Activity)?.inMultiWindow() != true
         val needsFallback = !nativeHandoffAttempted ||
             canDetectHandoffFailure && !awaitForegroundHandoff() && claimFallback()
         if (needsFallback) {
             try {
-                launchCustomTab(activity, authorizeUri)
+                launchCustomTab(activity, web.uri)
             } catch (e: ActivityNotFoundException) {
                 return LogiAuthError.Network(e)
             }
@@ -948,9 +989,11 @@ object LogiAuth {
                 if (nativeHandoffAttempted && !fallbackLaunched &&
                     !sawBackgroundSinceLaunch && !activity.inMultiWindow()
                 ) {
-                    val uri = pendingAuthorizeUri
-                    if (uri != null && claimFallback()) {
-                        runCatching { launchCustomTab(activity, uri) }.onFailure {
+                    // `.uri` only here, at the Custom Tab call: the slot is typed
+                    // [WebLeg] so this cannot silently become the handoff host.
+                    val web = pendingAuthorizeUri
+                    if (web != null && claimFallback()) {
+                        runCatching { launchCustomTab(activity, web.uri) }.onFailure {
                             // Clear persisted state BEFORE completing: the
                             // resumed caller can start a new flow the instant
                             // the deferred resolves, and a clear() landing after
