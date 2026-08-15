@@ -11,13 +11,20 @@ internal value class NativeLeg(val uri: Uri)
 
 /**
  * The browser leg of a sign-in — the same authorize request on the **issuer**
- * host, which must stay unclaimed.
+ * host, which is meant to stay unclaimed.
  *
  * 🔴 The only users who ever reach this leg are the ones without the logi app
  * installed, and for them this leg is the entire sign-in. Putting it on the
  * claimed host is what yanks a browser sign-in into the logi app mid-flow and
  * returns the callback to the wrong browser (the iOS SDK shipped that bug as
  * the axhub `state mismatch` incident).
+ *
+ * ⚠️ As of 2026-08-15 `api.1pass.dev/.well-known/assetlinks.json` still grants
+ * `handle_all_urls` to `com.dcodelabs.logi`, so this leg **is** interceptable
+ * today — moving the handoff off it is the first half of the fix, and the claim
+ * comes off once every RP has shipped a host-splitting SDK. Until then a
+ * fallback that fires while the logi app is installed can still be captured.
+ * Keeping the split correct now is what makes that removal safe later.
  *
  * Why two wrapper types instead of two `Uri` parameters: the surface that
  * consumes them ([LogiAuth.launchAuthorizationSurface] and the deferred

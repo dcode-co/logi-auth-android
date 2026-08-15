@@ -69,12 +69,19 @@ data class LogiAuthConfig(
             // `trim()` before parsing: a stray space in the issuer string makes
             // URI() throw, which would silently resolve to null — i.e. no split,
             // leaving the browser leg on the claimed host with no error anywhere.
-            val issuerHost = runCatching { java.net.URI(issuer.trim()).host }.getOrNull()
-            return if (issuerHost?.lowercase() == DEFAULT_ISSUER_HOST) {
-                DEFAULT_NATIVE_AUTHORIZE_HOST
-            } else {
-                issuerHost
-            }
+            val parsed = runCatching { java.net.URI(issuer.trim()) }.getOrNull() ?: return null
+            // The whole issuer must be stock, not just its host. `https://
+            // api.1pass.dev:8443` or `https://api.1pass.dev/tenant-a` is a
+            // different deployment that merely shares a hostname; derivation
+            // there would aim the native leg at production while the token
+            // exchange stays on the configured issuer. (codex review P2.)
+            val isStockIssuer = parsed.scheme.equals("https", ignoreCase = true) &&
+                parsed.host?.lowercase() == DEFAULT_ISSUER_HOST &&
+                (parsed.port == -1 || parsed.port == 443) &&
+                parsed.path.orEmpty().trim('/').isEmpty() &&
+                parsed.rawQuery == null &&
+                parsed.rawUserInfo == null
+            return if (isStockIssuer) DEFAULT_NATIVE_AUTHORIZE_HOST else parsed.host
         }
 
     companion object {

@@ -82,6 +82,43 @@ class AuthorizeHostSplitTest {
         assertEquals("open.1pass.dev", config(issuer = "  https://api.1pass.dev  ").resolvedNativeAuthorizeHost)
     }
 
+    /**
+     * Sharing a hostname is not being the stock deployment. A custom port or a
+     * tenant path is a different server, and derivation there would aim the
+     * native leg at production while token exchange stays on the configured
+     * issuer — the two legs would hit different deployments.
+     */
+    @Test
+    fun `same host on a custom port does not derive`() {
+        assertEquals(
+            "api.1pass.dev",
+            config(issuer = "https://api.1pass.dev:8443").resolvedNativeAuthorizeHost,
+        )
+    }
+
+    @Test
+    fun `same host under a tenant path does not derive`() {
+        assertEquals(
+            "api.1pass.dev",
+            config(issuer = "https://api.1pass.dev/tenant-a").resolvedNativeAuthorizeHost,
+        )
+    }
+
+    @Test
+    fun `explicit default port still counts as stock`() {
+        assertEquals("open.1pass.dev", config(issuer = "https://api.1pass.dev:443").resolvedNativeAuthorizeHost)
+    }
+
+    @Test
+    fun `trailing slash still counts as stock`() {
+        assertEquals("open.1pass.dev", config(issuer = "https://api.1pass.dev/").resolvedNativeAuthorizeHost)
+    }
+
+    @Test
+    fun `plain http on the stock host does not derive`() {
+        assertEquals("api.1pass.dev", config(issuer = "http://api.1pass.dev").resolvedNativeAuthorizeHost)
+    }
+
     // MARK: - withHost
 
     private val webUrl =

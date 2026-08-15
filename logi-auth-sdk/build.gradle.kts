@@ -63,7 +63,15 @@ afterEvaluate {
                 // (LogiAuthError.HandoffTimeout). Binary compatible; minor
                 // because a `when` over LogiAuthError with no `else` needs one
                 // more branch to recompile.
-                version = "1.1.0"
+                // 1.2.0: authorize handoff host split — the app-to-app leg moves
+                // to `open.1pass.dev` while the browser fallback stays on the
+                // issuer. Additive API (`nativeAuthorizeHost` defaults to null),
+                // but the native leg's target changes on recompile alone.
+                // 🔴 Bump this together with logi-auth-storage's version: that
+                // module publishes `api(project(":logi-auth-sdk"))` as a POM
+                // dependency pinned to whatever is written here, so leaving it
+                // behind makes storage consumers silently pull the old core.
+                version = "1.2.0"
                 pom {
                     name.set("logi-auth-android")
                     licenses {

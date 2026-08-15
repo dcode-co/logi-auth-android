@@ -43,7 +43,11 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.dcode-co.logi-auth-android"
                 artifactId = "logi-auth-storage"
-                version = "1.1.0"
+                // Must match logi-auth-sdk's publication version — `api(project(
+                // ":logi-auth-sdk"))` above becomes a POM dependency stamped with
+                // that version, so a lagging bump here ships storage against the
+                // old core.
+                version = "1.2.0"
                 pom {
                     name.set("logi-auth-storage")
                     licenses {
